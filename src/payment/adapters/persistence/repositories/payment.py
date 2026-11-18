@@ -3,9 +3,11 @@
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment.adapters.persistence.orm import payments_table
+from payment.application.exceptions import IdempotencyViolation
 from payment.domain.model.enums import Currency, PaymentStatus
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import IdempotencyKey, Money, PaymentId, WebhookUrl
@@ -49,7 +51,11 @@ class SqlAlchemyPaymentRepository:
         self._session = session
 
     async def add(self, payment: Payment) -> None:
-        await self._session.execute(insert(payments_table).values(**_to_row_values(payment)))
+        try:
+            await self._session.execute(insert(payments_table).values(**_to_row_values(payment)))
+        except IntegrityError as exc:
+            # уникальность idempotency_key: наружу — не SQLAlchemy, а application-исключение
+            raise IdempotencyViolation(payment.idempotency_key.value) from exc
 
     async def try_claim(self, payment_id: PaymentId, ttl_seconds: float) -> datetime | None:
         """Атомарный клейм: pending + свободен/протух -> locked_until = now() + ttl."""

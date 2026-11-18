@@ -15,15 +15,12 @@ import signal
 from faststream.rabbit import RabbitBroker, RabbitMessage
 
 from payment.adapters.messaging.connection import connect_with_retry
+from payment.adapters.messaging.routing import ATTEMPT_HEADER, route_failure
 from payment.adapters.messaging.schemas import PaymentCreatedMessage
 from payment.adapters.messaging.topology import declare_topology, main_queue
 from payment.application.use_cases.process_payment import ProcessPayment
 from payment.bootstrap import Container
-from payment.entrypoints.consumer.handlers import (
-    ATTEMPT_HEADER,
-    decide_failure,
-    parse_payment_id,
-)
+from payment.domain.model.value_objects import PaymentId
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +55,10 @@ def build_consumer_app(container: Container | None = None) -> RabbitBroker:
             await _ack(message)
             return
         try:
-            result = await use_case.execute(parse_payment_id(event.model_dump()))
+            result = await use_case.execute(PaymentId.from_string(event.payment_id))
             logger.info("payment %s processed: %s", event.payment_id, result.status)
         except Exception as exc:  # noqa: BLE001 — инфраструктурный сбой: retry/DLQ
-            decision = decide_failure(
+            decision = route_failure(
                 message.headers, policy, queue_name=queue_name, dlq_name=dlq_name
             )
             if decision.action == "retry":

@@ -29,11 +29,13 @@ async def require_api_key(
 
 
 def build_create_payment(request: Request) -> CreatePayment:
-    return request.app.state.create_payment
+    """Новый use case на каждый запрос: свой UoW и своя сессия."""
+    return request.app.state.container.create_payment()
 
 
 def build_get_payment(request: Request) -> GetPayment:
-    return request.app.state.get_payment
+    """Новый use case на каждый запрос: свой UoW и своя сессия."""
+    return request.app.state.container.get_payment()
 
 
 __all__ = ["get_settings", "require_api_key", "build_create_payment", "build_get_payment"]

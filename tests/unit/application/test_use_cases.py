@@ -14,15 +14,18 @@ from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
 from tests.fakes import FakeGateway, FakeUnitOfWork, FakeWebhookSender
 
 
-def command(idempotency_key: str = "key-1") -> CreatePaymentCommand:
+def command(
+    idempotency_key: str = "key-1",
+    amount: Decimal = Decimal("100.00"),
+    description: str = "Test payment",
+) -> CreatePaymentCommand:
     return CreatePaymentCommand(
-        amount=Decimal("100.00"),
+        amount=amount,
         currency=Currency.RUB,
-        description="Test payment",
+        description=description,
         metadata={"order_id": "42"},
         idempotency_key=IdempotencyKey(idempotency_key),
         webhook_url="https://example.com/hook",
-        fingerprint="deadbeef",
     )
 
 
@@ -63,11 +66,9 @@ class TestCreatePayment:
         use_case = CreatePayment(uow=uow)
         await use_case.execute(command())
 
-        conflicting = command()
-        object.__setattr__(conflicting, "fingerprint", "different")
-
+        # другой body при том же ключе -> другой fingerprint -> 409
         with pytest.raises(IdempotencyConflict):
-            await use_case.execute(conflicting)
+            await use_case.execute(command(amount=Decimal("999.00")))
 
     async def test_integrity_error_race_returns_existing_payment(self) -> None:
         """Два одновременных запроса: проигравший получает существующий платёж, не 500."""
@@ -88,11 +89,9 @@ class TestCreatePayment:
         await use_case.execute(command())
 
         uow.payments.fail_next_add_with_integrity = True
-        conflicting = command()
-        object.__setattr__(conflicting, "fingerprint", "different")
-
+        # другой body при том же ключе -> другой fingerprint -> 409
         with pytest.raises(IdempotencyConflict):
-            await use_case.execute(conflicting)
+            await use_case.execute(command(amount=Decimal("999.00")))
 
 
 class TestProcessPayment:

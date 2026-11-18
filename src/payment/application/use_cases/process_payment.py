@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from typing import Callable
 
 from payment.application.dto import ProcessPaymentResult
 from payment.application.exceptions import PaymentNotFound
@@ -38,14 +37,12 @@ class ProcessPayment:
         gateway: PaymentGateway,
         webhook_sender: WebhookSender,
         retry_policy: ExponentialBackoffRetryPolicy | None = None,
-        sign: Callable[[dict], str] | None = None,
         claim_ttl_seconds: float = 60.0,
     ) -> None:
         self._uow = uow
         self._gateway = gateway
         self._webhook_sender = webhook_sender
         self._retry_policy = retry_policy or ExponentialBackoffRetryPolicy()
-        self._sign = sign or (lambda payload: "")
         self._claim_ttl = claim_ttl_seconds
 
     async def execute(self, payment_id: PaymentId) -> ProcessPaymentResult:
@@ -118,14 +115,12 @@ class ProcessPayment:
 
     async def _notify(self, payment: Payment) -> None:
         payload = self._payload(payment)
-        signature = self._sign(payload)
         attempts = 0
         while True:
             attempts += 1
             try:
-                await self._webhook_sender.send(
-                    url=payment.webhook_url.value, payload=payload, signature=signature
-                )
+                # подпись ставит адаптер: сериализация и HMAC живут в одном месте
+                await self._webhook_sender.send(url=payment.webhook_url.value, payload=payload)
                 return
             except Exception:  # noqa: BLE001 — недоставка фиксируется, статус уже сохранён
                 if self._retry_policy.is_exhausted(attempts=attempts):

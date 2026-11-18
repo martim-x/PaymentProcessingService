@@ -26,8 +26,8 @@ def create_app(container: Container | None = None) -> FastAPI:
     )
     app.state.container = container or Container()
     app.state.settings = app.state.container.settings
-    app.state.create_payment = app.state.container.create_payment()
-    app.state.get_payment = app.state.container.get_payment()
+    # use case'ы создаются НА ЗАПРОС: UoW внутри держит сессию, и общий
+    # экземпляр на всё приложение смешал бы транзакции параллельных запросов
 
     app.include_router(payments_router)
     register_error_handlers(app)
