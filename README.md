@@ -98,6 +98,9 @@ PY
 
 ## Разработка
 
+Проект требует Python ≥ 3.12; **локально весь набор тестов и линтеров прогнан на
+Python 3.15.2** (venv проекта), в CI используется 3.13.
+
 ```bash
 python3.13 -m venv venv
 venv/bin/pip install -e ".[test]" ruff mypy bandit pre-commit
