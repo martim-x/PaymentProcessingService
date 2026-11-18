@@ -1,7 +1,7 @@
 """Счётчик попыток consumer'а: x-attempt переживает повторную публикацию."""
 
+from payment.adapters.messaging.routing import ATTEMPT_HEADER, next_attempt, route_failure
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
-from payment.entrypoints.consumer.handlers import ATTEMPT_HEADER, decide_failure, next_attempt
 
 
 class TestNextAttempt:
@@ -35,7 +35,7 @@ class TestDecideFailure:
     def test_retry_targets_numbered_queue(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=3)
 
-        decision = decide_failure(
+        decision = route_failure(
             {ATTEMPT_HEADER: 1}, policy, queue_name="payments.new", dlq_name="payments.dlq"
         )
 
@@ -46,7 +46,7 @@ class TestDecideFailure:
     def test_last_attempt_goes_to_dlq(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=3)
 
-        decision = decide_failure(
+        decision = route_failure(
             {ATTEMPT_HEADER: 2}, policy, queue_name="payments.new", dlq_name="custom.dlq"
         )
 
@@ -75,6 +75,6 @@ class TestRetryChainReachesDlq:
     def test_custom_queue_names_are_respected(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=2)
 
-        decision = decide_failure({}, policy, queue_name="orders.new", dlq_name="orders.dlq")
+        decision = route_failure({}, policy, queue_name="orders.new", dlq_name="orders.dlq")
 
         assert decision.queue == "orders.new.retry.1"

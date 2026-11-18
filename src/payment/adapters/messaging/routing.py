@@ -1,19 +1,20 @@
-"""Чистые функции consumer'а: решения о retry/DLQ (тестируются без брокера)."""
+"""Политика маршрутизации упавших сообщений (retry-очередь или DLQ).
 
-import uuid
+Живёт в адаптере, а не в обработчике: entrypoint не должен решать,
+сколько попыток и куда класть сообщение.
+"""
+
 from dataclasses import dataclass
 from typing import Literal
 
-from payment.domain.model.value_objects import PaymentId
+from payment.adapters.messaging.topology import retry_queue_name
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
 
 ATTEMPT_HEADER = "x-attempt"
 
 
 @dataclass(frozen=True, slots=True)
-class FailureDecision:
-    """Что делать с упавшим сообщением."""
-
+class FailureRoute:
     action: Literal["retry", "dlq"]
     attempt: int
     queue: str
@@ -40,19 +41,17 @@ def next_attempt(headers: dict) -> int:
     return attempts + 1
 
 
-def decide_failure(
+def route_failure(
     headers: dict,
     policy: ExponentialBackoffRetryPolicy,
     *,
     queue_name: str,
     dlq_name: str,
-) -> FailureDecision:
+) -> FailureRoute:
     """Ретрай или DLQ: после policy.max_attempts сообщение уходит в DLQ."""
     attempt = next_attempt(headers)
     if policy.is_exhausted(attempts=attempt):
-        return FailureDecision(action="dlq", attempt=attempt, queue=dlq_name)
-    return FailureDecision(action="retry", attempt=attempt, queue=f"{queue_name}.retry.{attempt}")
-
-
-def parse_payment_id(payload: dict) -> PaymentId:
-    return PaymentId(value=uuid.UUID(str(payload["payment_id"])))
+        return FailureRoute(action="dlq", attempt=attempt, queue=dlq_name)
+    return FailureRoute(
+        action="retry", attempt=attempt, queue=retry_queue_name(queue_name, attempt)
+    )

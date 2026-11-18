@@ -8,7 +8,6 @@ from payment.adapters.messaging.publisher import FastStreamPublisher
 from payment.adapters.persistence.database import make_engine, make_sessionmaker
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
 from payment.adapters.webhook.http_sender import HttpxWebhookSender
-from payment.adapters.webhook.signer import serialize, sign_body
 from payment.application.use_cases.create_payment import CreatePayment
 from payment.application.use_cases.get_payment import GetPayment
 from payment.application.use_cases.process_payment import ProcessPayment
@@ -35,6 +34,7 @@ class Container:
             success_rate=self.settings.success_rate,
         )
         self.webhook_sender = HttpxWebhookSender(
+            secret=self.settings.webhook_secret,
             timeout_seconds=self.settings.webhook_timeout,
             allow_private_hosts=self.settings.webhook_allow_private_hosts,
         )
@@ -55,7 +55,6 @@ class Container:
             gateway=self.gateway,
             webhook_sender=self.webhook_sender,
             retry_policy=self.retry_policy,
-            sign=self.sign,
             claim_ttl_seconds=self.settings.claim_ttl_seconds,
         )
 
@@ -74,11 +73,6 @@ class Container:
 
     def get_broker_publisher(self) -> FastStreamPublisher:
         return FastStreamPublisher(self.get_broker())
-
-    def sign(self, payload: dict) -> str:
-        """X-Signature для тех же байтов, что отправит HttpxWebhookSender."""
-        header, _ = sign_body(self.settings.webhook_secret, serialize(payload))
-        return header
 
     async def dispose(self) -> None:
         if self._broker is not None:

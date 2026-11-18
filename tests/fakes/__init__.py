@@ -32,10 +32,10 @@ class FakePaymentRepository:
 
     async def add(self, payment: Payment) -> None:
         if self.fail_next_add_with_integrity:
-            from sqlalchemy.exc import IntegrityError
+            from payment.application.exceptions import IdempotencyViolation
 
             self.fail_next_add_with_integrity = False
-            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+            raise IdempotencyViolation(payment.idempotency_key.value)
         self._by_id[str(payment.id)] = payment
         self._by_key[payment.idempotency_key.value] = payment
 
@@ -165,11 +165,11 @@ class FakeWebhookSender:
         self.fail_first = fail_first
         self._calls = 0
 
-    async def send(self, *, url: str, payload: dict[str, Any], signature: str = "") -> None:
+    async def send(self, *, url: str, payload: dict[str, Any]) -> None:
         self._calls += 1
         if self._calls <= self.fail_first:
             raise RuntimeError("webhook endpoint unreachable")
-        self.sent.append({"url": url, "payload": payload, "signature": signature})
+        self.sent.append({"url": url, "payload": payload})
 
     @property
     def calls(self) -> int:

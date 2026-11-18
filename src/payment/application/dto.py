@@ -19,7 +19,6 @@ class CreatePaymentCommand:
     metadata: dict[str, Any]
     idempotency_key: IdempotencyKey
     webhook_url: str
-    fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)

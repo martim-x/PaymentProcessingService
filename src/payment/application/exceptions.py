@@ -11,6 +11,10 @@ class PaymentNotFound(ApplicationError):
         super().__init__(f"Payment {payment_id} not found")
 
 
+class IdempotencyViolation(ApplicationError):
+    """Нарушен unique-индекс idempotency_key (гонка двух одновременных POST)."""
+
+
 class IdempotencyConflict(ApplicationError):
     """Тот же Idempotency-Key, но другое тело запроса."""
 

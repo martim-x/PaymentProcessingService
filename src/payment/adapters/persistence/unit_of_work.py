@@ -20,12 +20,18 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
     def __init__(self, sessionmaker: async_sessionmaker) -> None:
         self._sessionmaker = sessionmaker
         self._session: Optional[AsyncSession] = None
+        self._in_use = False
 
     @property
     def session(self) -> Optional[AsyncSession]:
         return self._session
 
     async def __aenter__(self) -> "SqlAlchemyUnitOfWork":
+        if self._in_use:
+            # UoW хранит сессию: параллельное использование одного экземпляра
+            # смешало бы транзакции — это ошибка времени жизни зависимости
+            raise RuntimeError("UnitOfWork is already in use and is not concurrency-safe")
+        self._in_use = True
         self._session = self._sessionmaker()
         session = self._session
         assert session is not None
@@ -46,6 +52,7 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
             assert self._session is not None
             await self._session.close()
             self._session = None
+            self._in_use = False
 
     async def commit(self) -> None:
         assert self._session is not None

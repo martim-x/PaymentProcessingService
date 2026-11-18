@@ -28,10 +28,10 @@ class TestHttpxWebhookSender:
         monkeypatch.setattr(httpx, "AsyncClient", client_factory)
 
         body = serialize(PAYLOAD)
-        signature, timestamp = sign_body(SECRET, body)
-        sender = HttpxWebhookSender(timeout_seconds=1.0, allow_private_hosts=True)
+        _, timestamp = sign_body(SECRET, body)
+        sender = HttpxWebhookSender(secret=SECRET, timeout_seconds=1.0, allow_private_hosts=True)
 
-        await sender.send(url="http://example.com/hook", payload=PAYLOAD, signature=signature)
+        await sender.send(url="http://example.com/hook", payload=PAYLOAD)
 
         assert captured["body"] == body
         assert verify_body(SECRET, captured["body"], captured["headers"]["x-signature"])
@@ -46,7 +46,7 @@ class TestHttpxWebhookSender:
             return real_client(*args, **kwargs)
 
         monkeypatch.setattr(httpx, "AsyncClient", client_factory)
-        sender = HttpxWebhookSender(timeout_seconds=1.0, allow_private_hosts=True)
+        sender = HttpxWebhookSender(secret=SECRET, timeout_seconds=1.0, allow_private_hosts=True)
 
         try:
             await sender.send(url="http://example.com/hook", payload=PAYLOAD)

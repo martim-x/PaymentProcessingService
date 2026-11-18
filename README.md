@@ -69,6 +69,8 @@ curl http://localhost:8000/api/v1/payments/<payment_id> -H "X-API-Key: local-dev
 ```
 
 Подпись: заголовок `X-Signature: t=<unix-ts>,v1=<hex>` (плюс `X-Timestamp`).
+Сериализацию и HMAC делает сам адаптер `HttpxWebhookSender` — тело и подпись физически
+не могут разъехаться.
 HMAC-SHA256 считается от `f"{timestamp}.".encode() + body`, где `body` — ровно те байты,
 что уходят в сеть (канонический JSON: `sort_keys`, без пробелов).
 
@@ -99,7 +101,7 @@ PY
 | Механизм | Реализация |
 |---|---|
 | **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж; `relay` (поллинг `outbox WHERE sent=false`, `FOR UPDATE SKIP LOCKED`) публикует в `payments.new` и помечает sent |
-| **Идемпотентность** | Уникальный `idempotency_key` + fingerprint тела (sha256 канонического JSON): повтор → тот же платёж, конфликт → 409; consumer устойчив к дублям (at-least-once) |
+| **Идемпотентность** | Уникальный `idempotency_key` + fingerprint тела (sha256 канонического JSON, каноническая сумма: `100.5 ≡ 100.50`). Fingerprint считается в use case, а не в HTTP-слое; `IntegrityError` ловится в репозитории и превращается в `IdempotencyViolation`. Повтор → тот же платёж, конфликт → 409 |
 | **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3. Счётчик попыток едет в заголовке `x-attempt` (x-death теряется при перепубликации) |
 | **Клейм обработки** | Перед вызовом шлюза: `UPDATE ... SET locked_until = now() + PAYMENT_CLAIM_TTL_SECONDS WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())`. Дубликат сообщения клейм не получит → **двойного списания нет**; клейм истекает, поэтому упавший consumer не блокирует платёж. В шлюз дополнительно передаётся `idempotency_key` |
 | **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у записи растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не мешает остальным |
@@ -131,7 +133,12 @@ PY
   кастомный transport с подключением по проверенному IP). Литеральные приватные IP
   отсекаются ещё на API (`422`).
 - **Relay читает outbox с `FOR UPDATE SKIP LOCKED`** на время публикации батча —
-  несколько relay'ев безопасны, но «ядовитая» запись ретраится на каждом проходе.
+  несколько relay'ев безопасны; «ядовитая» запись ограничена `PAYMENT_OUTBOX_MAX_ATTEMPTS`.
+- **`ProcessPayment` — толстый use case**: вызов шлюза, финализация, payload и webhook-ретраи
+  в одном сценарии. Доставка уведомления заслуживает отдельного `NotifyWebhook` со своим
+  outbox — не реализовано (см. пункт про гарантию доставки).
+- **Политика retry/DLQ** вынесена в адаптер `adapters/messaging/routing.py`;
+  entrypoint только вызывает её.
 
 ## Разработка
 
@@ -165,6 +172,10 @@ pre-commit install   # ruff, bandit, mypy, unit-тесты на каждый к�
 
 GitHub Actions (`.github/workflows/ci.yml`) — 6 job'ов:
 **ruff → mypy → bandit → unit → integration (PG-сервис) → e2e (docker compose)**.
+
+**Время жизни зависимостей:** use case'ы создаются на каждый запрос
+(`Depends`-фабрика), UoW хранит сессию и защищён от повторного входа —
+иначе параллельные запросы смешали бы транзакции.
 
 Consumer берёт `PAYMENT_CONSUMER_PREFETCH` сообщений одновременно; webhook-ретраи
 выполняются внутри обработчика и занимают слот — при большом потоке поднимайте

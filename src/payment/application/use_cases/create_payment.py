@@ -1,13 +1,13 @@
 """Use case: идемпотентное создание платежа (API)."""
 
 import logging
-
-from sqlalchemy.exc import IntegrityError
+from decimal import Decimal
 
 from payment.application.dto import CreatePaymentCommand, CreatePaymentResult
-from payment.application.exceptions import IdempotencyConflict
+from payment.application.exceptions import IdempotencyConflict, IdempotencyViolation
 from payment.application.ports.repositories import AbstractUnitOfWork
 from payment.domain.events import PaymentCreated
+from payment.domain.model.fingerprint import compute_fingerprint
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import Money, PaymentId, WebhookUrl
 
@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 def _outbox_payload(event: PaymentCreated) -> dict:
     return {"event": "payment.created", "payment_id": str(event.payment_id)}
+
+
+def canonical_amount(amount: Decimal) -> str:
+    """'100.5' и '100.50' — одна и та же сумма, один и тот же fingerprint."""
+    return format(amount.normalize(), "f")
 
 
 class CreatePayment:
@@ -32,10 +37,23 @@ class CreatePayment:
     def __init__(self, *, uow: AbstractUnitOfWork) -> None:
         self._uow = uow
 
+    @staticmethod
+    def _fingerprint(command: CreatePaymentCommand) -> str:
+        """Бизнес-правило идемпотентности живёт здесь, а не в HTTP-слое."""
+        return compute_fingerprint(
+            {
+                "amount": canonical_amount(command.amount),
+                "currency": command.currency.value,
+                "description": command.description,
+                "metadata": dict(command.metadata),
+                "webhook_url": command.webhook_url,
+            }
+        )
+
     async def execute(self, command: CreatePaymentCommand) -> CreatePaymentResult:
         try:
             return await self._create(command)
-        except IntegrityError as exc:
+        except IdempotencyViolation as exc:
             logger.info(
                 "idempotency race for key %r; re-reading payment",
                 command.idempotency_key.value,
@@ -55,7 +73,7 @@ class CreatePayment:
                 metadata=command.metadata,
                 idempotency_key=command.idempotency_key,
                 webhook_url=WebhookUrl(command.webhook_url),
-                fingerprint=command.fingerprint,
+                fingerprint=self._fingerprint(command),
             )
             await uow.payments.add(payment)
 
@@ -70,7 +88,7 @@ class CreatePayment:
             return CreatePaymentResult(payment=payment, created=True)
 
     async def _read_existing(
-        self, command: CreatePaymentCommand, original: IntegrityError
+        self, command: CreatePaymentCommand, original: IdempotencyViolation
     ) -> CreatePaymentResult:
         async with self._uow as uow:
             existing = await uow.payments.get_by_idempotency_key(command.idempotency_key.value)
@@ -79,8 +97,7 @@ class CreatePayment:
             raise original from original
         return self._existing(command, existing)
 
-    @staticmethod
-    def _existing(command: CreatePaymentCommand, existing: Payment) -> CreatePaymentResult:
-        if existing.fingerprint != command.fingerprint:
+    def _existing(self, command: CreatePaymentCommand, existing: Payment) -> CreatePaymentResult:
+        if existing.fingerprint != self._fingerprint(command):
             raise IdempotencyConflict(command.idempotency_key.value)
         return CreatePaymentResult(payment=existing, created=False)

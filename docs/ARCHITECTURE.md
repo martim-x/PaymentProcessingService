@@ -83,8 +83,8 @@ entrypoints → bootstrap → adapters → application → domain
   - `publisher.py` — `FastStreamPublisher` (реализация `MessagePublisher`).
   - `schemas.py` — Pydantic-схема payload сообщения.
 - **`gateway/fake_gateway.py`** — эмуляция шлюза: 2–5 сек, 90% успех / 10% ошибка.
-- **`webhook/`** — `http_sender.py` (httpx POST с таймаутом), `signer.py`
-  (`X-Signature: sha256=<hex>` HMAC от секрета).
+- **`webhook/`** — `http_sender.py` (httpx: сериализация + HMAC + POST с таймаутом),
+  `signer.py` (`X-Signature: t=<ts>,v1=<hex>`, окно по времени), `guard.py` (SSRF).
 
 ### 4. `src/payment/entrypoints/` — двери в мир
 
@@ -95,9 +95,11 @@ entrypoints → bootstrap → adapters → application → domain
   `attempt` (TTL) → dead-letter обратно в main; после 3 попыток → `payments.dlq`.
   Попытка считается по заголовкам `x-death`.
 - **`relay/`** — бесконечный цикл: раз в `PAYMENT_RELAY_INTERVAL` сек пакет outbox
-  → RabbitMQ. Корректное завершение по SIGINT/SIGTERM.
+  → RabbitMQ. Корректное завершение по SIGINT/SIGTERM. Политика retry/DLQ —
+  в адаптере `adapters/messaging/routing.py`.
 - **`bootstrap.py`** — composition root (`Container`): единственное место сборки
-  зависимостей. Use case'ы создаются на запрос/сообщение.
+  зависимостей. Use case'ы создаются **на запрос/сообщение** — UoW хранит сессию,
+  общий экземпляр смешал бы транзакции параллельных запросов.
 
 ## Сущности и таблицы
 
