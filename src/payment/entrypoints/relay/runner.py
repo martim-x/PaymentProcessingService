@@ -27,7 +27,12 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
     broker = container.get_broker()
     await connect_with_retry(broker)
     # топологию объявляет и relay: публикация в необъявленную очередь теряется
-    await declare_topology(broker, container.retry_policy)
+    await declare_topology(
+        broker,
+        container.retry_policy,
+        container.settings.rabbitmq_queue,
+        container.settings.rabbitmq_dlq,
+    )
     try:
         while not stop.is_set():
             try:

@@ -30,7 +30,7 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(InvalidWebhookUrl)
     async def _domain_validation_error(request: Request, exc: DomainError) -> JSONResponse:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": str(exc)}
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content={"detail": str(exc)}
         )
 
     @app.exception_handler(ApplicationError)

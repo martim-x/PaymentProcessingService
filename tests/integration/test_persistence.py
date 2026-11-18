@@ -129,7 +129,9 @@ class TestProcessPaymentPersistStatus:
         pid = payment.id
 
         class OkGateway:
-            async def process(self, *, payment_id, amount, currency) -> GatewayResult:
+            async def process(
+                self, *, payment_id, amount, currency, idempotency_key=""
+            ) -> GatewayResult:
                 return GatewayResult(succeeded=True)
 
         use_case = ProcessPayment(
@@ -142,24 +144,67 @@ class TestProcessPaymentPersistStatus:
         assert result.status == "succeeded"
         assert loaded is not None and loaded.status.value == "succeeded"
 
-    async def test_try_finalize_is_atomic_and_idempotent(self, uow_factory) -> None:
+    async def test_claim_prevents_double_processing(self, uow_factory) -> None:
+        """Клейм выдаётся один раз: второй consumer не получит токен."""
         payment = make_payment("key-proc-2")
         async with uow_factory() as w:
             await w.payments.add(payment)
             await w.commit()
 
+        async with uow_factory() as w:
+            first_token = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+        async with uow_factory() as w:
+            second_token = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+
+        assert first_token is not None
+        assert second_token is None
+
+    async def test_finalize_requires_matching_claim_token(self, uow_factory) -> None:
+        payment = make_payment("key-proc-3")
+        async with uow_factory() as w:
+            await w.payments.add(payment)
+            await w.commit()
+
+        async with uow_factory() as w:
+            token = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+        assert token is not None
+
         payment.mark_succeeded()
         async with uow_factory() as w:
-            first = await w.payments.try_finalize(payment)
+            wrong = await w.payments.try_finalize(
+                payment,
+                claim_token=token.replace(year=1999) if hasattr(token, "replace") else token,
+            )
             await w.commit()
+        assert wrong is False
 
-        # второй consumer видит уже финальный статус — UPDATE не проходит
         async with uow_factory() as w:
-            second = await w.payments.try_finalize(payment)
+            right = await w.payments.try_finalize(payment, claim_token=token)
+            await w.commit()
+        async with uow_factory() as w:
+            again = await w.payments.try_finalize(payment, claim_token=token)
             await w.commit()
 
-        assert first is True
-        assert second is False
+        assert right is True
+        assert again is False
+
+    async def test_expired_claim_can_be_reacquired(self, uow_factory) -> None:
+        payment = make_payment("key-proc-4")
+        async with uow_factory() as w:
+            await w.payments.add(payment)
+            await w.commit()
+
+        async with uow_factory() as w:
+            await w.payments.try_claim(payment.id, ttl_seconds=0.0)
+            await w.commit()
+        async with uow_factory() as w:
+            token = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+
+        assert token is not None
 
 
 class TestOutboxRepository:

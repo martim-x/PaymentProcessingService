@@ -26,6 +26,7 @@ class FakePaymentGateway(PaymentGateway):
         payment_id: str,
         amount: object,
         currency: str,
+        idempotency_key: str = "",
     ) -> GatewayResult:
         delay = self._rng.uniform(self._min, self._max)
         await asyncio.sleep(delay)

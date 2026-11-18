@@ -40,7 +40,7 @@ class SqlAlchemyOutboxRepository:
     async def fetch_unsent(self, batch: int = 100) -> list[OutboxRecord]:
         result = await self._session.execute(
             select(outbox_table)
-            .where(outbox_table.c.sent.is_(False))
+            .where(outbox_table.c.sent.is_(False), outbox_table.c.failed.is_(False))
             .order_by(outbox_table.c.created_at)
             .limit(batch)
             .with_for_update(skip_locked=True)
@@ -53,3 +53,17 @@ class SqlAlchemyOutboxRepository:
             .where(outbox_table.c.id == record_id)
             .values(sent=True, sent_at=datetime.now(timezone.utc))
         )
+
+    async def mark_attempt_failed(self, record_id, max_attempts: int) -> bool:
+        """+1 к attempts; после max_attempts запись помечается failed (dead-letter)."""
+        result = await self._session.execute(
+            update(outbox_table)
+            .where(outbox_table.c.id == record_id)
+            .values(
+                attempts=outbox_table.c.attempts + 1,
+                failed=(outbox_table.c.attempts + 1) >= max_attempts,
+            )
+            .returning(outbox_table.c.failed)
+        )
+        row = result.first()
+        return bool(row.failed) if row is not None else False

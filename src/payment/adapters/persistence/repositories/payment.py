@@ -1,5 +1,7 @@
 """Репозиторий платежей на SQLAlchemy (ручной маппинг домена)."""
 
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,18 +51,37 @@ class SqlAlchemyPaymentRepository:
     async def add(self, payment: Payment) -> None:
         await self._session.execute(insert(payments_table).values(**_to_row_values(payment)))
 
-    async def try_finalize(self, payment: Payment) -> bool:
-        """UPDATE ... WHERE id = :id AND status = 'pending' — защита от двойной обработки."""
+    async def try_claim(self, payment_id: PaymentId, ttl_seconds: float) -> datetime | None:
+        """Атомарный клейм: pending + свободен/протух -> locked_until = now() + ttl."""
+        now = datetime.now(timezone.utc)
+        until = now + timedelta(seconds=ttl_seconds)
+        result = await self._session.execute(
+            update(payments_table)
+            .where(
+                payments_table.c.id == payment_id.value,
+                payments_table.c.status == PaymentStatus.PENDING.value,
+                (payments_table.c.locked_until.is_(None)) | (payments_table.c.locked_until < now),
+            )
+            .values(locked_until=until)
+            .returning(payments_table.c.locked_until)
+        )
+        row = result.first()
+        return row.locked_until if row is not None else None
+
+    async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
+        """UPDATE под клеймом: id + pending + locked_until = токен."""
         result = await self._session.execute(
             update(payments_table)
             .where(
                 payments_table.c.id == payment.id.value,
                 payments_table.c.status == PaymentStatus.PENDING.value,
+                payments_table.c.locked_until == claim_token,
             )
             .values(
                 status=payment.status.value,
                 failure_reason=payment.failure_reason,
                 processed_at=payment.processed_at,
+                locked_until=None,
             )
             .returning(payments_table.c.id)
         )

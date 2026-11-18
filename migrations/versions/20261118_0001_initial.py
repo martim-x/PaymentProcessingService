@@ -32,6 +32,7 @@ def upgrade() -> None:
         sa.Column("failure_reason", sa.Text(), nullable=True),
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), nullable=False),
         sa.Column("processed_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("locked_until", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
     )
     op.create_index("ix_payments_created_at", "payments", ["created_at"])
@@ -45,6 +46,8 @@ def upgrade() -> None:
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), nullable=False),
         sa.Column("sent", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("sent_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("failed", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
     )
     op.create_index(
         "ix_outbox_unsent",

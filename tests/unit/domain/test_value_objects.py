@@ -75,6 +75,17 @@ class TestWebhookUrl:
         with pytest.raises(InvalidWebhookUrl):
             WebhookUrl("ftp://example.com/hook")
 
+    def test_rejects_literal_private_ip(self) -> None:
+        with pytest.raises(InvalidWebhookUrl):
+            WebhookUrl("http://10.0.0.5/hook")
+
+    def test_rejects_literal_loopback_ip(self) -> None:
+        with pytest.raises(InvalidWebhookUrl):
+            WebhookUrl("http://127.0.0.1:9000/hook")
+
+    def test_accepts_public_literal_ip(self) -> None:
+        WebhookUrl("https://93.184.216.34/hook")
+
 
 class TestPaymentId:
     def test_generates_unique_ids(self) -> None:

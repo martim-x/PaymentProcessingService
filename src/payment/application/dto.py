@@ -6,7 +6,6 @@ from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
-from payment.application.ports.repositories import OutboxRecord
 from payment.domain.model.enums import Currency
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import IdempotencyKey
@@ -65,16 +64,3 @@ class PaymentDetails:
             created_at=payment.created_at,
             processed_at=payment.processed_at,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class OutboxMessage:
-    """Сообщение, готовое к публикации в брокер."""
-
-    id: UUID
-    aggregate_id: str
-    payload: dict[str, Any]
-
-    @staticmethod
-    def from_record(record: OutboxRecord) -> "OutboxMessage":
-        return OutboxMessage(id=record.id, aggregate_id=record.aggregate_id, payload=record.payload)

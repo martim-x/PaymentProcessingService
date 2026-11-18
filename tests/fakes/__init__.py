@@ -5,7 +5,7 @@
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from payment.domain.model.enums import PaymentStatus
@@ -27,6 +27,8 @@ class FakePaymentRepository:
         self.fail_next_add_with_integrity = False
         # имитация платежа, уже обработанного другим consumer'ом
         self.finalized_elsewhere: set[str] = set()
+        # имитация активного клейма (другой consumer прямо сейчас обрабатывает)
+        self.claimed: set[str] = set()
 
     async def add(self, payment: Payment) -> None:
         if self.fail_next_add_with_integrity:
@@ -37,11 +39,25 @@ class FakePaymentRepository:
         self._by_id[str(payment.id)] = payment
         self._by_key[payment.idempotency_key.value] = payment
 
-    async def try_finalize(self, payment: Payment) -> bool:
-        if str(payment.id) in self.finalized_elsewhere:
+    async def try_claim(self, payment_id: PaymentId, ttl_seconds: float):
+        key = str(payment_id)
+        payment = self._by_id.get(key)
+        if payment is None:
+            return None
+        if payment.status is not PaymentStatus.PENDING:
+            return None
+        if key in self.claimed:
+            return None
+        self.claimed.add(key)
+        return datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+
+    async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
+        key = str(payment.id)
+        if key in self.finalized_elsewhere:
             return False
-        self._by_id[str(payment.id)] = payment
-        self.finalized_elsewhere.add(str(payment.id))
+        self._by_id[key] = payment
+        self.finalized_elsewhere.add(key)
+        self.claimed.discard(key)
         return True
 
     async def get(self, payment_id: PaymentId) -> Payment | None:
@@ -59,6 +75,7 @@ class FakeOutboxRecord:
         self.sent = False
         self.published_at: datetime | None = None
         self.attempts = 0
+        self.failed = False
 
 
 class FakeOutboxRepository:
@@ -71,7 +88,15 @@ class FakeOutboxRepository:
         return record
 
     async def fetch_unsent(self, batch: int = 100) -> list[FakeOutboxRecord]:
-        return [r for r in self._records if not r.sent][:batch]
+        return [r for r in self._records if not r.sent and not r.failed][:batch]
+
+    async def mark_attempt_failed(self, record_id, max_attempts: int) -> bool:
+        for r in self._records:
+            if r.id == record_id:
+                r.attempts += 1
+                r.failed = r.attempts >= max_attempts
+                return r.failed
+        return False
 
     async def mark_sent(self, record_id: uuid.UUID) -> None:
         for r in self._records:
@@ -119,9 +144,18 @@ class FakeGateway:
         self.succeed = succeed
         self.reason = reason
         self.calls = 0
+        self.last_idempotency_key = ""
 
-    async def process(self, *, payment_id: str, amount: Any, currency: str) -> GatewayResult:
+    async def process(
+        self,
+        *,
+        payment_id: str,
+        amount: Any,
+        currency: str,
+        idempotency_key: str = "",
+    ) -> GatewayResult:
         self.calls += 1
+        self.last_idempotency_key = idempotency_key
         return GatewayResult(succeeded=self.succeed, reason=self.reason)
 
 
@@ -143,13 +177,16 @@ class FakeWebhookSender:
 
 
 class FakeMessagePublisher:
-    def __init__(self, *, fail_first: int = 0) -> None:
+    def __init__(self, *, fail_first: int = 0, poison_payload: dict | None = None) -> None:
         self.published: list[tuple[str, dict[str, Any]]] = []
         self.fail_first = fail_first
+        self.poison_payload = poison_payload
         self._calls = 0
 
     async def publish(self, *, subject: str, payload: dict[str, Any]) -> None:
         self._calls += 1
+        if self.poison_payload is not None and payload == self.poison_payload:
+            raise RuntimeError("publish rejected for this payload")
         if self._calls <= self.fail_first:
             raise RuntimeError("broker is down")
         self.published.append((subject, payload))
