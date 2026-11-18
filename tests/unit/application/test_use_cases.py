@@ -174,6 +174,38 @@ class TestProcessPayment:
         assert outcome.status == "succeeded"
         assert webhook.calls == 3  # max_attempts попыток
 
+    async def test_concurrent_claim_blocks_second_gateway_call(self) -> None:
+        """Другой consumer держит клейм: шлюз не вызывается вовсе (нет двойного списания)."""
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+        uow.payments.claimed.add(str(pid))  # имитируем активный клейм
+
+        gateway = FakeGateway(succeed=True)
+        webhook = FakeWebhookSender()
+        use_case = ProcessPayment(
+            uow=uow, gateway=gateway, webhook_sender=webhook, retry_policy=fast_policy()
+        )
+
+        outcome = await use_case.execute(pid)
+
+        assert gateway.calls == 0
+        assert webhook.calls == 0
+        assert outcome.status == "pending"
+
+    async def test_gateway_receives_idempotency_key(self) -> None:
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+
+        gateway = FakeGateway(succeed=True)
+        use_case = ProcessPayment(
+            uow=uow, gateway=gateway, webhook_sender=FakeWebhookSender(), retry_policy=fast_policy()
+        )
+
+        await use_case.execute(created.payment.id)
+
+        assert gateway.last_idempotency_key == str(created.payment.id)
+
     async def test_unknown_payment_raises(self) -> None:
         use_case = ProcessPayment(
             uow=FakeUnitOfWork(),

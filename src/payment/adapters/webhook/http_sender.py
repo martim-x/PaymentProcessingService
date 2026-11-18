@@ -2,7 +2,7 @@
 
 import httpx
 
-from payment.adapters.webhook.guard import validate_public_http_url
+from payment.adapters.webhook.guard import validate_public_http_url_async
 from payment.adapters.webhook.signer import serialize
 from payment.application.ports.webhook_sender import WebhookSender
 
@@ -16,7 +16,7 @@ class HttpxWebhookSender(WebhookSender):
 
     async def send(self, *, url: str, payload: dict, signature: str = "") -> None:
         if not self._allow_private_hosts:
-            validate_public_http_url(url)
+            await validate_public_http_url_async(url)
 
         body = serialize(payload)
         headers = {"Content-Type": "application/json"}

@@ -100,7 +100,9 @@ PY
 |---|---|
 | **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж; `relay` (поллинг `outbox WHERE sent=false`, `FOR UPDATE SKIP LOCKED`) публикует в `payments.new` и помечает sent |
 | **Идемпотентность** | Уникальный `idempotency_key` + fingerprint тела (sha256 канонического JSON): повтор → тот же платёж, конфликт → 409; consumer устойчив к дублям (at-least-once) |
-| **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3 |
+| **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3. Счётчик попыток едет в заголовке `x-attempt` (x-death теряется при перепубликации) |
+| **Клейм обработки** | Перед вызовом шлюза: `UPDATE ... SET locked_until = now() + PAYMENT_CLAIM_TTL_SECONDS WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())`. Дубликат сообщения клейм не получит → **двойного списания нет**; клейм истекает, поэтому упавший consumer не блокирует платёж. В шлюз дополнительно передаётся `idempotency_key` |
+| **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у записи растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не мешает остальным |
 | **DLQ** | После 3 попыток сообщение уходит в `payments.dlq` (и из main по `x-dead-letter`) |
 | **Webhook retry** | Попытки с экспоненциальной задержкой (`ExponentialBackoffRetryPolicy`), статус платежа уже закоммичен и от webhook не зависит |
 
@@ -124,6 +126,10 @@ PY
   отдельный outbox webhook-событий с собственным retry — не реализовано.
 - **Отправленные строки outbox не чистятся**: индекс `ix_outbox_unsent` частичный
   (`WHERE sent = false`), но сама таблица растёт — нужна периодическая архивация.
+- **SSRF-проверка при отправке идёт отдельным DNS-запросом**, поэтому теоретически
+  возможен DNS-rebinding между проверкой и коннектом httpx (для полной защиты нужен
+  кастомный transport с подключением по проверенному IP). Литеральные приватные IP
+  отсекаются ещё на API (`422`).
 - **Relay читает outbox с `FOR UPDATE SKIP LOCKED`** на время публикации батча —
   несколько relay'ев безопасны, но «ядовитая» запись ретраится на каждом проходе.
 
@@ -160,7 +166,11 @@ pre-commit install   # ruff, bandit, mypy, unit-тесты на каждый к�
 GitHub Actions (`.github/workflows/ci.yml`) — 6 job'ов:
 **ruff → mypy → bandit → unit → integration (PG-сервис) → e2e (docker compose)**.
 
-Integration-тесты требуют PostgreSQL:
+Consumer берёт `PAYMENT_CONSUMER_PREFETCH` сообщений одновременно; webhook-ретраи
+выполняются внутри обработчика и занимают слот — при большом потоке поднимайте
+и prefetch, и число consumer-реплик.
+
+Интеграционные тесты требуют PostgreSQL:
 
 ```bash
 PAYMENT_DATABASE_URL=postgresql+psycopg://payment:payment@localhost:5433/payments \

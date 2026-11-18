@@ -56,6 +56,7 @@ class Container:
             webhook_sender=self.webhook_sender,
             retry_policy=self.retry_policy,
             sign=self.sign,
+            claim_ttl_seconds=self.settings.claim_ttl_seconds,
         )
 
     def publish_outbox(self) -> PublishOutbox:
@@ -63,6 +64,7 @@ class Container:
             uow=self.uow(),
             publisher=self.get_broker_publisher(),
             subject=self.settings.rabbitmq_queue,
+            max_attempts=self.settings.outbox_max_attempts,
         )
 
     def get_broker(self) -> RabbitBroker:

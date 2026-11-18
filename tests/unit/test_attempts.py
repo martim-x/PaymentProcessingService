@@ -1,7 +1,7 @@
 """Счётчик попыток consumer'а: x-attempt переживает повторную публикацию."""
 
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
-from payment.entrypoints.consumer.handlers import ATTEMPT_HEADER, next_attempt
+from payment.entrypoints.consumer.handlers import ATTEMPT_HEADER, decide_failure, next_attempt
 
 
 class TestNextAttempt:
@@ -31,6 +31,30 @@ class TestNextAttempt:
         assert next_attempt({ATTEMPT_HEADER: "not-a-number"}) == 1
 
 
+class TestDecideFailure:
+    def test_retry_targets_numbered_queue(self) -> None:
+        policy = ExponentialBackoffRetryPolicy(max_attempts=3)
+
+        decision = decide_failure(
+            {ATTEMPT_HEADER: 1}, policy, queue_name="payments.new", dlq_name="payments.dlq"
+        )
+
+        assert decision.action == "retry"
+        assert decision.attempt == 2
+        assert decision.queue == "payments.new.retry.2"
+
+    def test_last_attempt_goes_to_dlq(self) -> None:
+        policy = ExponentialBackoffRetryPolicy(max_attempts=3)
+
+        decision = decide_failure(
+            {ATTEMPT_HEADER: 2}, policy, queue_name="payments.new", dlq_name="custom.dlq"
+        )
+
+        assert decision.action == "dlq"
+        assert decision.attempt == 3
+        assert decision.queue == "custom.dlq"
+
+
 class TestRetryChainReachesDlq:
     """Главная регрессия: цепочка попыток обязана дойти до DLQ, а не крутиться вечно."""
 
@@ -47,3 +71,10 @@ class TestRetryChainReachesDlq:
             headers = {ATTEMPT_HEADER: attempt}
 
         assert attempts == [1, 2, 3]
+
+    def test_custom_queue_names_are_respected(self) -> None:
+        policy = ExponentialBackoffRetryPolicy(max_attempts=2)
+
+        decision = decide_failure({}, policy, queue_name="orders.new", dlq_name="orders.dlq")
+
+        assert decision.queue == "orders.new.retry.1"

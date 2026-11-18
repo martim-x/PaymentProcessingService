@@ -9,7 +9,6 @@ from payment.application.exceptions import PaymentNotFound
 from payment.application.ports.payment_gateway import GatewayResult, PaymentGateway
 from payment.application.ports.repositories import AbstractUnitOfWork
 from payment.application.ports.webhook_sender import WebhookSender
-from payment.domain.model.enums import PaymentStatus
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import PaymentId
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
@@ -18,14 +17,18 @@ logger = logging.getLogger(__name__)
 
 
 class ProcessPayment:
-    """Обрабатывает один платёж: шлюз -> финальный статус -> webhook.
+    """Обрабатывает один платёж: claim -> шлюз -> финальный статус -> webhook.
 
-    - шлюз вызывается ВНЕ транзакции (не держим соединение на внешнем I/O);
-    - финальный статус пишется условным UPDATE ... WHERE status='pending':
-      при дубликате сообщения второй consumer получит False и не продублирует
-      ни списание, ни webhook;
-    - статус коммитится ДО отправки webhook: недоступный webhook не должен
-      возвращать платёж в очередь.
+    - заявка на обработку берётся ДО вызова шлюза: атомарный
+      `UPDATE ... SET locked_until = now() + ttl WHERE status='pending' AND
+      (locked_until IS NULL OR locked_until < now())`. Дубликат сообщения
+      клейм не получит, поэтому списание не повторится;
+    - клейм истекает (PAYMENT_CLAIM_TTL), поэтому упавший consumer не
+      блокирует платёж навсегда — повторное сообщение переклеймит его;
+    - в шлюз передаётся idempotency_key (id платежа) — второй рубеж защиты;
+    - шлюз вызывается ВНЕ транзакции, финальный статус фиксируется условным
+      UPDATE под токеном клейма;
+    - статус коммитится ДО отправки webhook.
     """
 
     def __init__(
@@ -36,36 +39,50 @@ class ProcessPayment:
         webhook_sender: WebhookSender,
         retry_policy: ExponentialBackoffRetryPolicy | None = None,
         sign: Callable[[dict], str] | None = None,
+        claim_ttl_seconds: float = 60.0,
     ) -> None:
         self._uow = uow
         self._gateway = gateway
         self._webhook_sender = webhook_sender
         self._retry_policy = retry_policy or ExponentialBackoffRetryPolicy()
         self._sign = sign or (lambda payload: "")
+        self._claim_ttl = claim_ttl_seconds
 
     async def execute(self, payment_id: PaymentId) -> ProcessPaymentResult:
-        payment = await self._load(payment_id)
-        if payment.status is not PaymentStatus.PENDING:
-            # at-least-once: дубликат сообщения по уже обработанному платежу
+        claim_token = await self._claim(payment_id)
+        if claim_token is None:
+            # платёж уже финализирован или прямо сейчас обрабатывается дубликатом
+            payment = await self._load(payment_id)
+            logger.info(
+                "payment %s: claim not acquired (status=%s)", payment_id, payment.status.value
+            )
             return self._result(payment)
 
+        payment = await self._load(payment_id)
         result: GatewayResult = await self._gateway.process(
             payment_id=str(payment.id),
             amount=payment.amount.amount,
             currency=payment.amount.currency.value,
+            idempotency_key=str(payment.id),
         )
         payment.mark_succeeded() if result.succeeded else payment.mark_failed(
             reason=result.reason or "gateway rejected the payment"
         )
         payment.collect_events()  # события домена не имеют подписчиков — просто очищаем буфер
 
-        won = await self._finalize(payment)
+        won = await self._finalize(payment, claim_token)
         if not won:
-            logger.info("payment %s already processed by another consumer", payment.id)
+            logger.info("payment %s: claim expired or already finalized", payment.id)
             return self._result(payment)
 
         await self._notify(payment)
         return self._result(payment)
+
+    async def _claim(self, payment_id: PaymentId):
+        async with self._uow as uow:
+            token = await uow.payments.try_claim(payment_id, self._claim_ttl)
+            await uow.commit()
+        return token
 
     async def _load(self, payment_id: PaymentId) -> Payment:
         async with self._uow as uow:
@@ -74,9 +91,9 @@ class ProcessPayment:
             raise PaymentNotFound(str(payment_id))
         return payment
 
-    async def _finalize(self, payment: Payment) -> bool:
+    async def _finalize(self, payment: Payment, claim_token) -> bool:
         async with self._uow as uow:
-            won = await uow.payments.try_finalize(payment)
+            won = await uow.payments.try_finalize(payment, claim_token)
             await uow.commit()
         return won
 

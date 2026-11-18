@@ -25,6 +25,8 @@ class Payment:
     failure_reason: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     processed_at: Optional[datetime] = None
+    # внутренний клейм обработки: не отдаётся в API, защищает от двойного списания
+    locked_until: Optional[datetime] = None
     _events: list[_DomainEvent] = field(default_factory=list, repr=False, compare=False)
 
     @classmethod

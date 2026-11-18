@@ -1,18 +1,9 @@
-"""Use case: PublishOutbox — relay публикует несент записи и помечает их."""
+"""Use case: PublishOutbox — публикация батча с изоляцией «ядовитых» записей."""
 
-import pytest
-
-from payment.application.dto import OutboxMessage
 from payment.application.use_cases.publish_outbox import PublishOutbox
 from tests.fakes import FakeMessagePublisher, FakeUnitOfWork
 
-
-def message(aggregate_id: str = "p1") -> OutboxMessage:
-    return OutboxMessage(
-        id="6f9619ff-8b86-d011-b42d-00cf4fc964ff",
-        aggregate_id=aggregate_id,
-        payload={"event": "payment.created", "payment_id": aggregate_id},
-    )
+POISON = {"event": "payment.created", "payment_id": "poison"}
 
 
 class TestPublishOutbox:
@@ -29,17 +20,50 @@ class TestPublishOutbox:
         assert publisher.published[0][0] == "payments.new"
         assert (await uow.outbox.fetch_unsent(batch=10)) == []
 
-    async def test_broker_failure_leaves_record_unsent(self) -> None:
+    async def test_broker_failure_keeps_record_unsent_and_counts_attempt(self) -> None:
         uow = FakeUnitOfWork()
         await uow.outbox.add(payload={"event": "payment.created"}, aggregate_id="p1")
         publisher = FakeMessagePublisher(fail_first=1)
-        use_case = PublishOutbox(uow=uow, publisher=publisher)
+        use_case = PublishOutbox(uow=uow, publisher=publisher, max_attempts=5)
 
-        with pytest.raises(RuntimeError):
-            await use_case.execute(batch=10)
+        published = await use_case.execute(batch=10)
 
+        assert published == 0  # батч не упал, запись осталась несент
         unsent = await uow.outbox.fetch_unsent(batch=10)
         assert len(unsent) == 1
+        assert unsent[0].attempts == 1
+
+    async def test_poison_record_does_not_block_others(self) -> None:
+        """«Ядовитая» запись в середине батча не мешает остальным уйти."""
+        uow = FakeUnitOfWork()
+        await uow.outbox.add(payload={"n": 1}, aggregate_id="a1")
+        await uow.outbox.add(payload=POISON, aggregate_id="a2")
+        await uow.outbox.add(payload={"n": 3}, aggregate_id="a3")
+        publisher = FakeMessagePublisher(poison_payload=POISON)
+        use_case = PublishOutbox(uow=uow, publisher=publisher, max_attempts=5)
+
+        published = await use_case.execute(batch=10)
+
+        assert published == 2
+        payloads = [payload["n"] for _, payload in publisher.published]
+        assert payloads == [1, 3]
+        unsent = await uow.outbox.fetch_unsent(batch=10)
+        assert [r.payload for r in unsent] == [POISON]
+        assert unsent[0].attempts == 1
+
+    async def test_poison_record_becomes_failed_after_max_attempts(self) -> None:
+        uow = FakeUnitOfWork()
+        await uow.outbox.add(payload=POISON, aggregate_id="a1")
+        publisher = FakeMessagePublisher(poison_payload=POISON)
+        use_case = PublishOutbox(uow=uow, publisher=publisher, max_attempts=2)
+
+        await use_case.execute(batch=10)
+        await use_case.execute(batch=10)
+        # после двух неудач запись помечена failed и больше не выбирается
+        assert await uow.outbox.fetch_unsent(batch=10) == []
+        all_records = uow.outbox.all_records()
+        assert all_records[0].failed is True
+        assert all_records[0].attempts == 2
 
     async def test_empty_outbox_publishes_nothing(self) -> None:
         uow = FakeUnitOfWork()

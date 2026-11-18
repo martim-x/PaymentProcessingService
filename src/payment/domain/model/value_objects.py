@@ -1,5 +1,6 @@
 """Значимые объекты (Value Objects) домена."""
 
+import ipaddress
 import uuid
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -67,8 +68,26 @@ class WebhookUrl:
         if not self.value:
             raise InvalidWebhookUrl(self.value)
         parsed = urlsplit(self.value)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise InvalidWebhookUrl(self.value)
+        # литеральный приватный/loopback IP отклоняем сразу (без DNS) — 422 на API
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            return
+        if not _ip_is_public(address):
+            raise InvalidWebhookUrl(self.value)
+
+
+def _ip_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
 
 
 def to_decimal(raw: Any) -> Decimal:

@@ -7,6 +7,7 @@ from sqlalchemy import (
     TIMESTAMP,
     Boolean,
     Column,
+    Integer,
     MetaData,
     Numeric,
     String,
@@ -32,6 +33,7 @@ payments_table = Table(
     Column("failure_reason", Text, nullable=True),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
     Column("processed_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("locked_until", TIMESTAMP(timezone=True), nullable=True),
 )
 
 outbox_table = Table(
@@ -44,4 +46,6 @@ outbox_table = Table(
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
     Column("sent", Boolean, nullable=False, default=False),
     Column("sent_at", TIMESTAMP(timezone=True), nullable=True),
+    Column("failed", Boolean, nullable=False, default=False),
+    Column("attempts", Integer, nullable=False, default=0),
 )

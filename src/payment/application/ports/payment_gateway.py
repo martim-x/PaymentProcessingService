@@ -1,15 +1,18 @@
 """Порт: внешний платёжный шлюз."""
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
 class GatewayResult:
     succeeded: bool
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
-@runtime_checkable
 class PaymentGateway(Protocol):
-    async def process(self, *, payment_id: str, amount: object, currency: str) -> GatewayResult: ...
+    async def process(
+        self, *, payment_id: str, amount: object, currency: str, idempotency_key: str = ""
+    ) -> GatewayResult:
+        """idempotency_key защищает от повторного списания у реального шлюза."""
+        ...

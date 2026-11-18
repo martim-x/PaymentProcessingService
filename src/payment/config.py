@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # RabbitMQ
     rabbitmq_url: str = "amqp://guest:guest@rabbitmq:5672/"
     rabbitmq_queue: str = "payments.new"
+    rabbitmq_dlq: str = "payments.dlq"
 
     # Outbox relay
     relay_interval: float = 1.0
@@ -48,6 +49,13 @@ class Settings(BaseSettings):
     max_attempts: int = 3
     retry_base_delay: float = 1.0
     retry_factor: float = 2.0
+
+    # Клейм обработки платежа: дольше, чем шлюз + webhook-ретраи
+    claim_ttl_seconds: float = 60.0
+    # Сколько раз relay пытается опубликовать «ядовитую» запись outbox
+    outbox_max_attempts: int = 10
+    # Prefetch consumer'а: сколько сообщений он берёт из очереди одновременно
+    consumer_prefetch: int = 10
 
     @model_validator(mode="after")
     def _check_secrets(self) -> "Settings":
