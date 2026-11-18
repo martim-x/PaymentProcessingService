@@ -35,6 +35,8 @@ services:
       PAYMENT_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       PAYMENT_API_KEY: local-dev-key
       PAYMENT_WEBHOOK_SECRET: local-webhook-secret
+      # локальный стенд: webhook ходит на host.docker.internal (частный адрес)
+      PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
     command: alembic upgrade head
     depends_on:
       postgres:

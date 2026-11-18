@@ -46,7 +46,12 @@ def upgrade() -> None:
         sa.Column("sent", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("sent_at", sa.TIMESTAMP(timezone=True), nullable=True),
     )
-    op.create_index("ix_outbox_unsent", "outbox", ["sent", "created_at"])
+    op.create_index(
+        "ix_outbox_unsent",
+        "outbox",
+        ["created_at"],
+        postgresql_where=sa.text("sent = false"),
+    )
 
 
 def downgrade() -> None:

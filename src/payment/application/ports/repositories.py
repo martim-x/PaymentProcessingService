@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol
 
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import PaymentId
@@ -19,27 +19,30 @@ class OutboxRecord:
     attempts: int = 0
 
 
-@runtime_checkable
 class PaymentRepository(Protocol):
     async def add(self, payment: Payment) -> None: ...
 
-    async def save(self, payment: Payment) -> None: ...
+    async def try_finalize(self, payment: Payment) -> bool:
+        """Атомарно фиксирует финальный статус, только если он ещё pending.
 
-    async def get(self, payment_id: PaymentId) -> Optional[Payment]: ...
+        Возвращает False, если платёж уже обработан другим consumer'ом —
+        в этом случае побочные эффекты (webhook) повторять нельзя.
+        """
+        ...
 
-    async def get_by_idempotency_key(self, key: str) -> Optional[Payment]: ...
+    async def get(self, payment_id: PaymentId) -> Payment | None: ...
+
+    async def get_by_idempotency_key(self, key: str) -> Payment | None: ...
 
 
-@runtime_checkable
 class OutboxRepository(Protocol):
     async def add(self, *, payload: dict, aggregate_id: str) -> OutboxRecord: ...
 
     async def fetch_unsent(self, batch: int = 100) -> list[OutboxRecord]: ...
 
-    async def mark_sent(self, record_id) -> None: ...
+    async def mark_sent(self, record_id: object) -> None: ...
 
 
-@runtime_checkable
 class AbstractUnitOfWork(Protocol):
     """Единица работы: коммит атомарен для payments + outbox."""
 
@@ -50,9 +53,9 @@ class AbstractUnitOfWork(Protocol):
 
     async def __aexit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> None: ...
 
     async def commit(self) -> None: ...

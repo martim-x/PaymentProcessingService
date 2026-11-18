@@ -10,12 +10,12 @@
                                                 v
                                           payments.dlq
 
-Задержки берутся из той же ExponentialBackoffRetryPolicy, что и webhook-ретраи,
-поэтому PAYMENT_MAX_ATTEMPTS / PAYMENT_RETRY_BASE_DELAY / PAYMENT_RETRY_FACTOR
-управляют обеими цепочками.
+Задержки берутся из ExponentialBackoffRetryPolicy (PAYMENT_RETRY_*).
+Топологию объявляют И consumer, И relay: публикация в необъявленную очередь
+через default exchange молча теряется, а outbox-запись помечается sent.
 """
 
-from faststream.rabbit import RabbitQueue
+from faststream.rabbit import RabbitBroker, RabbitQueue
 
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
 
@@ -58,3 +58,14 @@ def retry_queue(attempt: int, policy: ExponentialBackoffRetryPolicy | None = Non
 
 def dlq_queue() -> RabbitQueue:
     return RabbitQueue(name=DLQ_QUEUE, durable=True)
+
+
+async def declare_topology(
+    broker: RabbitBroker, policy: ExponentialBackoffRetryPolicy | None = None
+) -> None:
+    """Объявляет main, retry-очереди и DLQ (идемпотентно для RabbitMQ)."""
+    policy = policy or ExponentialBackoffRetryPolicy()
+    queues = [main_queue(), dlq_queue()]
+    queues += [retry_queue(i, policy) for i in range(1, policy.max_attempts)]
+    for queue in queues:
+        await broker.declare_queue(queue)

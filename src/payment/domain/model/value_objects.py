@@ -10,6 +10,8 @@ from payment.domain.exceptions import InvalidMoney, InvalidWebhookUrl
 from payment.domain.model.enums import Currency
 
 _MONEY_QUANT = Decimal("0.0001")
+# Numeric(19,4): 15 целых цифр + 4 дробных
+_MONEY_MAX = Decimal("999999999999999.9999")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,9 +25,10 @@ class Money:
         if self.amount <= 0:
             raise InvalidMoney(self.amount, "amount must be positive")
         # нормализация точности до 4 знаков (Numeric(19,4) в БД)
-        object.__setattr__(
-            self, "amount", self.amount.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
-        )
+        quantized = self.amount.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
+        if quantized > _MONEY_MAX:
+            raise InvalidMoney(self.amount, "amount exceeds the supported maximum")
+        object.__setattr__(self, "amount", quantized)
 
 
 @dataclass(frozen=True, slots=True)

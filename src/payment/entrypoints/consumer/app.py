@@ -2,7 +2,9 @@
 
 Один обработчик делает всё: получает сообщение, обрабатывает платёж,
 обновляет статус и отправляет webhook. Инфраструктурные сбои (БД и т.п.)
-уходят в retry-очереди с экспоненциальным TTL, после 3 попыток — в DLQ.
+уходят в retry-очереди с экспоненциальным TTL, после max_attempts — в DLQ.
+Счётчик попыток едет в заголовке `x-attempt`, потому что x-death теряется
+при повторной публикации.
 """
 
 import asyncio
@@ -12,29 +14,19 @@ import signal
 
 from faststream.rabbit import RabbitBroker, RabbitMessage
 
+from payment.adapters.messaging.connection import connect_with_retry
 from payment.adapters.messaging.schemas import PaymentCreatedMessage
 from payment.adapters.messaging.topology import (
     DLQ_QUEUE,
-    MAX_ATTEMPTS,
     RETRY_QUEUE_FMT,
-    dlq_queue,
+    declare_topology,
     main_queue,
-    retry_queue,
 )
 from payment.application.use_cases.process_payment import ProcessPayment
 from payment.bootstrap import Container
-from payment.entrypoints.consumer.handlers import is_retry_exhausted, parse_payment_id
+from payment.entrypoints.consumer.handlers import ATTEMPT_HEADER, next_attempt, parse_payment_id
 
 logger = logging.getLogger(__name__)
-
-
-def attempt_from_headers(headers: dict) -> int:
-    """Сколько раз сообщение уже побывало в retry-очередях (по x-death)."""
-    attempts = 0
-    for death in headers.get("x-death") or []:
-        if str(death.get("queue", "")).startswith("payments.new.retry."):
-            attempts += int(death.get("count", 1))
-    return attempts
 
 
 async def _ack(message: RabbitMessage) -> None:
@@ -47,6 +39,7 @@ async def _ack(message: RabbitMessage) -> None:
 def build_consumer_app(container: Container | None = None) -> RabbitBroker:
     container = container or Container()
     broker = container.get_broker()
+    policy = container.retry_policy
 
     @broker.subscriber(main_queue())
     async def handle_payment_created(message: RabbitMessage) -> None:
@@ -65,8 +58,8 @@ def build_consumer_app(container: Container | None = None) -> RabbitBroker:
             result = await use_case.execute(parse_payment_id(event.model_dump()))
             logger.info("payment %s processed: %s", event.payment_id, result.status)
         except Exception as exc:  # noqa: BLE001 — инфраструктурный сбой: retry/DLQ
-            attempt = attempt_from_headers(message.headers) + 1
-            if not is_retry_exhausted(attempt, MAX_ATTEMPTS):
+            attempt = next_attempt(message.headers)
+            if not policy.is_exhausted(attempts=attempt):
                 target = RETRY_QUEUE_FMT.format(attempt=attempt)
                 logger.warning(
                     "payment %s failed (%s); retry %d via %s",
@@ -75,7 +68,7 @@ def build_consumer_app(container: Container | None = None) -> RabbitBroker:
                     attempt,
                     target,
                 )
-                await broker.publish(payload, queue=target)
+                await broker.publish(payload, queue=target, headers={ATTEMPT_HEADER: attempt})
             else:
                 logger.error(
                     "payment %s failed %d times (%s); -> DLQ", event.payment_id, attempt, exc
@@ -86,19 +79,13 @@ def build_consumer_app(container: Container | None = None) -> RabbitBroker:
     return broker
 
 
-async def declare_topology(broker: RabbitBroker) -> None:
-    """Объявляет retry-очереди и DLQ (main объявит сам subscriber)."""
-    for q in (*[retry_queue(i) for i in range(1, MAX_ATTEMPTS)], dlq_queue()):
-        await broker.declare_queue(q)
-
-
 async def run_consumer(container: Container | None = None) -> None:
     """Точка входа consumer-процесса (retry подключения к брокеру при старте)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     container = container or Container()
     broker = build_consumer_app(container)
-    await _connect_with_retry(broker)
-    await declare_topology(broker)
+    await connect_with_retry(broker)
+    await declare_topology(broker, container.retry_policy)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -108,21 +95,6 @@ async def run_consumer(container: Container | None = None) -> None:
         await stop.wait()  # живём, пока не придёт сигнал
     finally:
         await broker.stop()
-
-
-async def _connect_with_retry(broker: RabbitBroker, attempts: int = 10, delay: float = 2.0) -> None:
-    """RabbitMQ может отчитаться healthy раньше, чем откроет AMQP-порт."""
-    last: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            await broker.connect()
-            return
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            logger.warning("broker connect failed (%d/%d): %s", attempt, attempts, exc)
-            await asyncio.sleep(delay)
-    assert last is not None
-    raise last
 
 
 if __name__ == "__main__":

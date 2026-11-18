@@ -6,8 +6,9 @@
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
+from payment.domain.model.enums import PaymentStatus
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import PaymentId
 
@@ -15,25 +16,38 @@ from payment.domain.model.value_objects import PaymentId
 @dataclass(frozen=True, slots=True)
 class GatewayResult:
     succeeded: bool
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 class FakePaymentRepository:
     def __init__(self) -> None:
         self._by_id: dict[str, Payment] = {}
         self._by_key: dict[str, Payment] = {}
+        # имитация гонки на unique index: add() падает IntegrityError
+        self.fail_next_add_with_integrity = False
+        # имитация платежа, уже обработанного другим consumer'ом
+        self.finalized_elsewhere: set[str] = set()
 
     async def add(self, payment: Payment) -> None:
+        if self.fail_next_add_with_integrity:
+            from sqlalchemy.exc import IntegrityError
+
+            self.fail_next_add_with_integrity = False
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
         self._by_id[str(payment.id)] = payment
         self._by_key[payment.idempotency_key.value] = payment
 
-    async def save(self, payment: Payment) -> None:
+    async def try_finalize(self, payment: Payment) -> bool:
+        if str(payment.id) in self.finalized_elsewhere:
+            return False
         self._by_id[str(payment.id)] = payment
+        self.finalized_elsewhere.add(str(payment.id))
+        return True
 
-    async def get(self, payment_id: PaymentId) -> Optional[Payment]:
+    async def get(self, payment_id: PaymentId) -> Payment | None:
         return self._by_id.get(str(payment_id))
 
-    async def get_by_idempotency_key(self, key: str) -> Optional[Payment]:
+    async def get_by_idempotency_key(self, key: str) -> Payment | None:
         return self._by_key.get(key)
 
 
@@ -43,7 +57,7 @@ class FakeOutboxRecord:
         self.payload = payload
         self.aggregate_id = aggregate_id
         self.sent = False
-        self.published_at: Optional[datetime] = None
+        self.published_at: datetime | None = None
         self.attempts = 0
 
 
@@ -92,11 +106,16 @@ class FakeUnitOfWork:
     async def rollback(self) -> None:
         self.rolled_back += 1
 
+    def add_payment_directly(self, payment: Payment) -> None:
+        """Тестовый хелпер: положить платёж, не вызывая add()."""
+        self.payments._by_id[str(payment.id)] = payment  # noqa: SLF001
+        self.payments._by_key[payment.idempotency_key.value] = payment  # noqa: SLF001
+
 
 class FakeGateway:
     """Эмулирует шлюз: результат задаётся заранее."""
 
-    def __init__(self, *, succeed: bool = True, reason: Optional[str] = None) -> None:
+    def __init__(self, *, succeed: bool = True, reason: str | None = None) -> None:
         self.succeed = succeed
         self.reason = reason
         self.calls = 0
@@ -138,3 +157,16 @@ class FakeMessagePublisher:
     @property
     def calls(self) -> int:
         return self._calls
+
+
+__all__ = [
+    "GatewayResult",
+    "FakePaymentRepository",
+    "FakeOutboxRecord",
+    "FakeOutboxRepository",
+    "FakeUnitOfWork",
+    "FakeGateway",
+    "FakeWebhookSender",
+    "FakeMessagePublisher",
+    "PaymentStatus",
+]

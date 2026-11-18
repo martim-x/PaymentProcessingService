@@ -1,5 +1,6 @@
 """Роутер /api/v1/payments."""
 
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
@@ -26,16 +27,22 @@ router = APIRouter(
 )
 
 
+def _canonical_amount(amount: Decimal) -> str:
+    """'100.5' и '100.50' должны давать один fingerprint (одна и та же сумма)."""
+    return format(amount.normalize(), "f")
+
+
 def _command(body: CreatePaymentRequest, idempotency_key: str) -> CreatePaymentCommand:
+    amount = to_decimal(body.amount)
     raw = {
-        "amount": str(body.amount),
+        "amount": _canonical_amount(amount),
         "currency": body.currency,
         "description": body.description,
         "metadata": body.metadata,
         "webhook_url": body.webhook_url,
     }
     return CreatePaymentCommand(
-        amount=to_decimal(body.amount),
+        amount=amount,
         currency=Currency(body.currency),
         description=body.description,
         metadata=dict(body.metadata),

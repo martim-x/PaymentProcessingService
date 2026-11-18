@@ -31,6 +31,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["src", "."]
 testpaths = ["tests"]
 
@@ -39,7 +40,12 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = ["E", "F", "I", "W", "B", "BLE", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S311", "S105", "S106", "BLE001"]
+"src/payment/adapters/gateway/fake_gateway.py" = ["S311"]  # random — эмуляция шлюза
+"src/payment/adapters/persistence/unit_of_work.py" = ["S101"]  # assert — внутренние инварианты
 
 [tool.bandit]
 exclude_dirs = ["tests", "venv", "migrations"]
@@ -47,13 +53,9 @@ exclude_dirs = ["tests", "venv", "migrations"]
 skips = ["B101", "B311"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 ignore_missing_imports = true
 check_untyped_defs = true
 no_implicit_optional = true
 warn_unused_ignores = false
 exclude = ["venv", "tests"]
-
-[[tool.mypy.overrides]]
-module = ["migrations.*", "payment.entrypoints.*"]
-disable_error_code = ["arg-type", "assignment", "union-attr", "call-arg", "attr-defined"]
