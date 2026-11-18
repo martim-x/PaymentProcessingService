@@ -114,7 +114,7 @@ class TestUnitOfWork:
 
 
 class TestProcessPaymentPersistStatus:
-    """Регрессия: статус должен реально обновляться в БД (load и update в одном UoW)."""
+    """Регрессия: статус должен реально обновляться в БД и не перезаписываться дважды."""
 
     async def test_process_persists_succeeded(self, uow_factory) -> None:
         from payment.application.ports.payment_gateway import GatewayResult
@@ -141,6 +141,25 @@ class TestProcessPaymentPersistStatus:
             loaded = await w.payments.get(pid)
         assert result.status == "succeeded"
         assert loaded is not None and loaded.status.value == "succeeded"
+
+    async def test_try_finalize_is_atomic_and_idempotent(self, uow_factory) -> None:
+        payment = make_payment("key-proc-2")
+        async with uow_factory() as w:
+            await w.payments.add(payment)
+            await w.commit()
+
+        payment.mark_succeeded()
+        async with uow_factory() as w:
+            first = await w.payments.try_finalize(payment)
+            await w.commit()
+
+        # второй consumer видит уже финальный статус — UPDATE не проходит
+        async with uow_factory() as w:
+            second = await w.payments.try_finalize(payment)
+            await w.commit()
+
+        assert first is True
+        assert second is False
 
 
 class TestOutboxRepository:

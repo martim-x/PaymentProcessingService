@@ -1,14 +1,15 @@
-"""Use case: CreatePayment — идемпотентное создание платежа."""
+"""Use cases: идемпотентность и обработка платежа на fake-портах."""
 
 from decimal import Decimal
 
 import pytest
 
 from payment.application.dto import CreatePaymentCommand
-from payment.application.exceptions import IdempotencyConflict
+from payment.application.exceptions import IdempotencyConflict, PaymentNotFound
 from payment.application.use_cases.create_payment import CreatePayment
+from payment.application.use_cases.process_payment import ProcessPayment
 from payment.domain.model.enums import Currency
-from payment.domain.model.value_objects import IdempotencyKey
+from payment.domain.model.value_objects import IdempotencyKey, PaymentId
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
 from tests.fakes import FakeGateway, FakeUnitOfWork, FakeWebhookSender
 
@@ -23,6 +24,11 @@ def command(idempotency_key: str = "key-1") -> CreatePaymentCommand:
         webhook_url="https://example.com/hook",
         fingerprint="deadbeef",
     )
+
+
+def fast_policy() -> ExponentialBackoffRetryPolicy:
+    """Нулевая задержка: тесты не должны ждать экспоненциальный backoff."""
+    return ExponentialBackoffRetryPolicy(max_attempts=3, base_delay=0.0, factor=1.0)
 
 
 class TestCreatePayment:
@@ -63,73 +69,117 @@ class TestCreatePayment:
         with pytest.raises(IdempotencyConflict):
             await use_case.execute(conflicting)
 
+    async def test_integrity_error_race_returns_existing_payment(self) -> None:
+        """Два одновременных запроса: проигравший получает существующий платёж, не 500."""
+        uow = FakeUnitOfWork()
+        use_case = CreatePayment(uow=uow)
+        winner = await use_case.execute(command())
+
+        # имитируем гонку: INSERT проигравшего падает на unique-индексе
+        uow.payments.fail_next_add_with_integrity = True
+        loser = await use_case.execute(command())
+
+        assert loser.created is False
+        assert loser.payment.id.value == winner.payment.id.value
+
+    async def test_integrity_error_race_with_different_body_is_conflict(self) -> None:
+        uow = FakeUnitOfWork()
+        use_case = CreatePayment(uow=uow)
+        await use_case.execute(command())
+
+        uow.payments.fail_next_add_with_integrity = True
+        conflicting = command()
+        object.__setattr__(conflicting, "fingerprint", "different")
+
+        with pytest.raises(IdempotencyConflict):
+            await use_case.execute(conflicting)
+
 
 class TestProcessPayment:
     async def test_success_marks_succeeded(self) -> None:
         uow = FakeUnitOfWork()
-        create = CreatePayment(uow=uow)
-        created = await create.execute(command())
-        uow.committed = 0
+        created = await CreatePayment(uow=uow).execute(command())
 
-        from payment.application.use_cases.process_payment import ProcessPayment
-
-        gateway = FakeGateway(succeed=True)
         webhook = FakeWebhookSender()
-        use_case = ProcessPayment(uow=uow, gateway=gateway, webhook_sender=webhook)
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=webhook,
+            retry_policy=fast_policy(),
+        )
 
         outcome = await use_case.execute(created.payment.id)
 
         assert outcome.status == "succeeded"
-        assert uow.committed == 1
         assert webhook.calls == 1
         assert webhook.sent[0]["payload"]["status"] == "succeeded"
 
     async def test_failure_marks_failed_reason_kept(self) -> None:
         uow = FakeUnitOfWork()
-        create = CreatePayment(uow=uow)
-        created = await create.execute(command())
-        uow.committed = 0
+        created = await CreatePayment(uow=uow).execute(command())
 
-        from payment.application.use_cases.process_payment import ProcessPayment
-
-        gateway = FakeGateway(succeed=False, reason="gateway said no")
-        webhook = FakeWebhookSender()
-        use_case = ProcessPayment(uow=uow, gateway=gateway, webhook_sender=webhook)
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=False, reason="gateway said no"),
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+        )
 
         outcome = await use_case.execute(created.payment.id)
 
         assert outcome.status == "failed"
         assert outcome.failure_reason == "gateway said no"
 
+    async def test_duplicate_message_does_not_notify_twice(self) -> None:
+        """Если платёж уже финализирован другим consumer'ом — webhook не дублируется."""
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+
+        first_webhook = FakeWebhookSender()
+        first = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=first_webhook,
+            retry_policy=fast_policy(),
+        )
+        await first.execute(pid)
+
+        second_webhook = FakeWebhookSender()
+        gateway = FakeGateway(succeed=True)
+        second = ProcessPayment(
+            uow=uow, gateway=gateway, webhook_sender=second_webhook, retry_policy=fast_policy()
+        )
+        outcome = await second.execute(pid)
+
+        assert first_webhook.calls == 1
+        assert second_webhook.calls == 0
+        assert gateway.calls == 0  # уже финальный статус: шлюз не вызываем
+        assert outcome.status == "succeeded"
+
     async def test_webhook_failure_does_not_change_payment_status(self) -> None:
         uow = FakeUnitOfWork()
-        create = CreatePayment(uow=uow)
-        created = await create.execute(command())
-        uow.committed = 0
+        created = await CreatePayment(uow=uow).execute(command())
 
-        from payment.application.use_cases.process_payment import ProcessPayment
-
-        gateway = FakeGateway(succeed=True)
         webhook = FakeWebhookSender(fail_first=99)  # всегда падает
-        # нулевая задержка: тест не должен ждать экспоненциальный backoff
-        fast_policy = ExponentialBackoffRetryPolicy(max_attempts=3, base_delay=0.0, factor=1.0)
         use_case = ProcessPayment(
-            uow=uow, gateway=gateway, webhook_sender=webhook, retry_policy=fast_policy
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=webhook,
+            retry_policy=fast_policy(),
         )
 
         outcome = await use_case.execute(created.payment.id)
 
         assert outcome.status == "succeeded"
-        assert webhook.calls > 0  # ретраились
+        assert webhook.calls == 3  # max_attempts попыток
 
     async def test_unknown_payment_raises(self) -> None:
-        from payment.application.exceptions import PaymentNotFound
-        from payment.application.use_cases.process_payment import ProcessPayment
-        from payment.domain.model.value_objects import PaymentId
-
-        uow = FakeUnitOfWork()
         use_case = ProcessPayment(
-            uow=uow, gateway=FakeGateway(), webhook_sender=FakeWebhookSender()
+            uow=FakeUnitOfWork(),
+            gateway=FakeGateway(),
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
         )
 
         with pytest.raises(PaymentNotFound):

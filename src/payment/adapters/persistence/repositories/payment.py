@@ -1,8 +1,6 @@
 """Репозиторий платежей на SQLAlchemy (ручной маппинг домена)."""
 
-from typing import Optional
-
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment.adapters.persistence.orm import payments_table
@@ -51,28 +49,31 @@ class SqlAlchemyPaymentRepository:
     async def add(self, payment: Payment) -> None:
         await self._session.execute(insert(payments_table).values(**_to_row_values(payment)))
 
-    async def save(self, payment: Payment) -> None:
-        """Обновляет изменяемые поля платежа (объекты detached — UPDATE явный)."""
-        from sqlalchemy import update
-
-        await self._session.execute(
+    async def try_finalize(self, payment: Payment) -> bool:
+        """UPDATE ... WHERE id = :id AND status = 'pending' — защита от двойной обработки."""
+        result = await self._session.execute(
             update(payments_table)
-            .where(payments_table.c.id == payment.id.value)
+            .where(
+                payments_table.c.id == payment.id.value,
+                payments_table.c.status == PaymentStatus.PENDING.value,
+            )
             .values(
                 status=payment.status.value,
                 failure_reason=payment.failure_reason,
                 processed_at=payment.processed_at,
             )
+            .returning(payments_table.c.id)
         )
+        return result.first() is not None
 
-    async def get(self, payment_id: PaymentId) -> Optional[Payment]:
+    async def get(self, payment_id: PaymentId) -> Payment | None:
         result = await self._session.execute(
             select(payments_table).where(payments_table.c.id == payment_id.value)
         )
         row = result.first()
         return _to_domain(row) if row is not None else None
 
-    async def get_by_idempotency_key(self, key: str) -> Optional[Payment]:
+    async def get_by_idempotency_key(self, key: str) -> Payment | None:
         result = await self._session.execute(
             select(payments_table).where(payments_table.c.idempotency_key == key)
         )

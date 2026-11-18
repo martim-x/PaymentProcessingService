@@ -7,8 +7,7 @@ consumer эмулирует шлюз (2–5 сек, 90/10), обновляет �
 отправляет webhook клиенту с подписью HMAC.
 
 Полное описание слоёв и сущностей — [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-(Схема архитектуры хранится локально в `docs/architecture.excalidraw` / `docs/architecture.png`
-и намеренно не публикуется в репозитории.)
+Схема архитектуры хранится локально (`docs/architecture.excalidraw`) и в репозиторий не входит.
 
 ## Стек
 
@@ -69,8 +68,17 @@ curl http://localhost:8000/api/v1/payments/<payment_id> -H "X-API-Key: local-dev
 {"status": "succeeded", "id": "…", "amount": "100.5000", "currency": "RUB", "…": "…"}
 ```
 
-Заголовок `X-Signature: sha256=<hex>` — HMAC-SHA256 тела от секрета
-`PAYMENT_WEBHOOK_SECRET` (проверка: `payment.adapters.webhook.signer.verify_payload`).
+Подпись: заголовок `X-Signature: t=<unix-ts>,v1=<hex>` (плюс `X-Timestamp`).
+HMAC-SHA256 считается от `f"{timestamp}.".encode() + body`, где `body` — ровно те байты,
+что уходят в сеть (канонический JSON: `sort_keys`, без пробелов).
+
+Проверка на стороне получателя:
+
+```python
+from payment.adapters.webhook.signer import verify_body
+
+ok = verify_body(secret, raw_request_body, request.headers["X-Signature"])
+```
 
 ### Локальный приём webhook
 
@@ -95,6 +103,29 @@ PY
 | **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3 |
 | **DLQ** | После 3 попыток сообщение уходит в `payments.dlq` (и из main по `x-dead-letter`) |
 | **Webhook retry** | Попытки с экспоненциальной задержкой (`ExponentialBackoffRetryPolicy`), статус платежа уже закоммичен и от webhook не зависит |
+
+## Безопасность
+
+- **Секреты обязательны**: `PAYMENT_API_KEY` и `PAYMENT_WEBHOOK_SECRET` не имеют рабочих
+  дефолтов — сервис падает при старте с пустым/заглушечным значением.
+- **Сравнение API-ключа** — `hmac.compare_digest` (константное время).
+- **SSRF-гард**: `webhook_url` проверяется перед отправкой — блокируются loopback,
+  приватные, link-local и зарезервированные адреса (после DNS-резолва).
+  Для локальных стендов есть `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`.
+- **Валидация**: ошибки домена (`InvalidMoney`, `InvalidWebhookUrl`) → `422`, а не `500`;
+  лимиты на `description` (1000) и `metadata` (8 KB), сумма ≤ `Numeric(19,4)`.
+- **Fingerprint** считается от канонической суммы (`100.5` ≡ `100.50`) — без ложных 409.
+- **Webhook-payload компактный**: без `metadata` и собственного `webhook_url`.
+
+## Ограничения (осознанные)
+
+- **Доставка webhook не идёт через outbox.** Если consumer упадёт между commit'ом статуса
+  и отправкой, уведомление потеряется (статус при этом корректен). Для гарантии нужен
+  отдельный outbox webhook-событий с собственным retry — не реализовано.
+- **Отправленные строки outbox не чистятся**: индекс `ix_outbox_unsent` частичный
+  (`WHERE sent = false`), но сама таблица растёт — нужна периодическая архивация.
+- **Relay читает outbox с `FOR UPDATE SKIP LOCKED`** на время публикации батча —
+  несколько relay'ев безопасны, но «ядовитая» запись ретраится на каждом проходе.
 
 ## Разработка
 
@@ -138,6 +169,7 @@ PAYMENT_DATABASE_URL=postgresql+psycopg://payment:payment@localhost:5433/payment
 
 E2E-тесты требуют поднятый compose (`docker compose up -d`) и слушают порт 9000
 для приёма webhook; адрес хоста из контейнера — `host.docker.internal`.
+E2E проверяет и саму HMAC-подпись: считает её заново от сырых байтов полученного тела.
 
 ## Структура
 

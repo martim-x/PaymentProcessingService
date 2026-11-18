@@ -1,11 +1,13 @@
 """E2E: полный сценарий против работающего docker compose стека.
 
 Запуск локально:  docker compose up --build -d  &&  pytest tests/e2e -q
-В CI: поднимается job'ом e2e (docker compose up --build -d --wait).
+В CI: поднимается job'ом e2e.
 
-Требует: PAYMENT_API_URL (по умолчанию http://localhost:8000), PAYMENT_API_KEY.
+Требует: PAYMENT_API_URL (по умолчанию http://localhost:8000), PAYMENT_API_KEY,
+PAYMENT_WEBHOOK_SECRET (должен совпадать с секретом сервиса).
 """
 
+import json
 import os
 import threading
 import time
@@ -15,24 +17,25 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 import pytest
 
+from payment.adapters.webhook.signer import verify_body
+
 API_URL = os.environ.get("PAYMENT_API_URL", "http://localhost:8000")
 API_KEY = os.environ.get("PAYMENT_API_KEY", "local-dev-key")
+WEBHOOK_SECRET = os.environ.get("PAYMENT_WEBHOOK_SECRET", "local-webhook-secret")
 WEBHOOK_PORT = int(os.environ.get("PAYMENT_E2E_WEBHOOK_PORT", "9000"))
 
 
 class WebhookCollector:
-    """Минимальный HTTP-сервер, собирающий webhook-уведомления в список."""
+    """Минимальный HTTP-сервер: собирает сырые байты тела и заголовок подписи."""
 
     def __init__(self) -> None:
-        self.received: list[tuple[str | None, dict]] = []
+        self.received: list[tuple[str | None, bytes]] = []
         server = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
                 body = self.rfile.read(int(self.headers["Content-Length"]))
-                import json
-
-                server.received.append((self.headers.get("X-Signature"), json.loads(body)))
+                server.received.append((self.headers.get("X-Signature"), body))
                 self.send_response(200)
                 self.end_headers()
 
@@ -50,8 +53,7 @@ class WebhookCollector:
 
     @staticmethod
     def docker_host_url() -> str:
-        # consumer работает внутри контейнера: адрес хоста должен быть
-        # host.docker.internal (на хосте-маке он не резолвится, поэтому без проверки DNS)
+        # consumer работает внутри контейнера: адрес хоста — host.docker.internal
         host = os.environ.get("PAYMENT_WEBHOOK_PUBLIC_HOST", "host.docker.internal")
         return f"http://{host}:{WEBHOOK_PORT}/webhook"
 
@@ -81,19 +83,18 @@ class TestFullFlow:
         collector = WebhookCollector()
         collector.start()
         key = f"e2e-{uuid.uuid4()}"
+        payload_json = {
+            "amount": "77.77",
+            "currency": "RUB",
+            "description": "E2E payment",
+            "metadata": {"run": "pytest"},
+            "webhook_url": collector.docker_host_url(),
+        }
         try:
             with httpx.Client(timeout=10.0) as client:
                 # 1. создание
                 r = client.post(
-                    f"{API_URL}/api/v1/payments",
-                    headers=headers(key),
-                    json={
-                        "amount": "77.77",
-                        "currency": "RUB",
-                        "description": "E2E payment",
-                        "metadata": {"run": "pytest"},
-                        "webhook_url": collector.docker_host_url(),
-                    },
+                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
                 )
                 assert r.status_code == 202, r.text
                 body = r.json()
@@ -103,15 +104,7 @@ class TestFullFlow:
 
                 # 2. идемпотентный повтор — тот же платёж
                 r2 = client.post(
-                    f"{API_URL}/api/v1/payments",
-                    headers=headers(key),
-                    json={
-                        "amount": "77.77",
-                        "currency": "RUB",
-                        "description": "E2E payment",
-                        "metadata": {"run": "pytest"},
-                        "webhook_url": collector.docker_host_url(),
-                    },
+                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
                 )
                 assert r2.status_code == 202
                 assert r2.json()["payment_id"] == payment_id
@@ -120,13 +113,7 @@ class TestFullFlow:
                 r3 = client.post(
                     f"{API_URL}/api/v1/payments",
                     headers=headers(key),
-                    json={
-                        "amount": "99.99",
-                        "currency": "USD",
-                        "description": "E2E conflict",
-                        "metadata": {},
-                        "webhook_url": collector.docker_host_url(),
-                    },
+                    json={**payload_json, "amount": "99.99", "currency": "USD"},
                 )
                 assert r3.status_code == 409, r3.text
 
@@ -137,15 +124,22 @@ class TestFullFlow:
                 if payment["status"] == "failed":
                     assert payment["failure_reason"]
 
-                # 5. webhook дошёл и подписан
+                # 5. webhook дошёл и подпись валидна для СЫРЫХ байтов тела
                 deadline = time.monotonic() + 15.0
                 while time.monotonic() < deadline and not collector.received:
                     time.sleep(0.3)
                 assert collector.received, "webhook was not delivered"
-                signature, payload = collector.received[0]
-                assert signature is not None and signature.startswith("sha256=")
-                assert payload["id"] == payment_id
-                assert payload["status"] == payment["status"]
+                signature, raw_body = collector.received[0]
+                assert signature is not None
+                assert verify_body(WEBHOOK_SECRET, raw_body, signature), (
+                    "signature does not match the delivered body"
+                )
+                webhook_payload = json.loads(raw_body)
+                assert webhook_payload["id"] == payment_id
+                assert webhook_payload["status"] == payment["status"]
+                # приватные данные не утекают в webhook
+                assert "webhook_url" not in webhook_payload
+                assert "metadata" not in webhook_payload
         finally:
             collector.stop()
 

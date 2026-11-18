@@ -5,6 +5,8 @@ import logging
 import signal
 from types import FrameType
 
+from payment.adapters.messaging.connection import connect_with_retry
+from payment.adapters.messaging.topology import declare_topology
 from payment.bootstrap import Container
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,9 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
         loop.add_signal_handler(sig, _on_signal, sig, None)
 
     broker = container.get_broker()
-    await _connect_with_retry(broker)
+    await connect_with_retry(broker)
+    # топологию объявляет и relay: публикация в необъявленную очередь теряется
+    await declare_topology(broker, container.retry_policy)
     try:
         while not stop.is_set():
             try:
@@ -31,7 +35,7 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
                 published = await use_case.execute(batch=batch)
                 if published:
                     logger.info("relay published %d events", published)
-            except Exception:
+            except Exception:  # noqa: BLE001 — одна итерация не должна убивать relay
                 logger.exception("relay iteration failed; will retry after interval")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -41,24 +45,7 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
         await broker.stop()
 
 
-async def _connect_with_retry(broker, attempts: int = 10, delay: float = 2.0) -> None:
-    """RabbitMQ может отчитаться healthy раньше, чем откроет AMQP-порт."""
-    last: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            await broker.connect()
-            return
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            logger.warning("broker connect failed (%d/%d): %s", attempt, attempts, exc)
-            await asyncio.sleep(delay)
-    assert last is not None
-    raise last
-
-
 def main() -> None:
-    import logging
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     container = Container()
     asyncio.run(

@@ -2,6 +2,7 @@
 
 Полное описание устройства сервиса: слои, сущности, поток платежа и схема надёжности.
 Смотри также: `ARCHITECTURE.MD` (исходный план структуры), `README.md` (запуск и примеры).
+Схема архитектуры — `docs/architecture.excalidraw` (локально, в репозиторий не входит).
 
 
 ## Общая картина
@@ -62,7 +63,7 @@ entrypoints → bootstrap → adapters → application → domain
     mark_sent. Падение брокера оставляет записи несент.
 - **`ports/`** — интерфейсы («розетки»), протоколы Python:
   `repositories.py` (`AbstractUnitOfWork`, `PaymentRepository`, `OutboxRepository`),
-  `payment_gateway.py`, `webhook_sender.py`, `message_publisher.py`, `clock.py`.
+  `payment_gateway.py`, `webhook_sender.py`, `message_publisher.py`.
 - **`dto.py`** — Command/Result-объекты (не Pydantic-схемы API).
 - **`exceptions.py`** — `PaymentNotFound`, `IdempotencyConflict`.
 
