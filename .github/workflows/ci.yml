@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  ruff:
+    name: Линтер (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+
+  mypy:
+    name: Типы (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Установка зависимостей
+        run: pip install -e ".[test]"
+      - run: pip install mypy
+      - run: mypy src/payment
+
+  bandit:
+    name: Безопасность (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "bandit[toml]"
+      - run: bandit -c pyproject.toml -q src
+
+  unit:
+    name: Unit-тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[test]"
+      - run: pytest tests/unit -q
+
+  integration:
+    name: Integration-тесты (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment
+          POSTGRES_DB: payments
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[test]"
+      - name: Миграции
+        env:
+          PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@localhost:5432/payments
+        run: alembic upgrade head
+      - name: Тесты
+        env:
+          PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@localhost:5432/payments
+        run: pytest tests/integration -q
+
+  e2e:
+    name: E2E (docker compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Установка зависимостей
+        run: pip install -e ".[test]"
+      - name: Поднять стек
+        run: docker compose up --build -d
+      - name: Дождаться готовности API
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health > /dev/null; then echo "API ready"; exit 0; fi
+            sleep 2
+          done
+          echo "API did not become ready"; docker compose logs --tail 100; exit 1
+      - name: Полный сценарий (API → outbox → consumer → webhook)
+        run: pytest tests/e2e -q
+        env:
+          PAYMENT_API_URL: http://localhost:8000
+          PAYMENT_API_KEY: local-dev-key
+      - name: Логи при падении
+        if: failure()
+        run: docker compose logs --tail 50

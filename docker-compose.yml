@@ -1,0 +1,89 @@
+name: payment-service
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+      POSTGRES_DB: payments
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5673:5672"
+      - "15673:15672"  # UI: http://localhost:15673
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    environment: &service_env
+      PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@postgres:5432/payments
+      PAYMENT_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      PAYMENT_API_KEY: local-dev-key
+      PAYMENT_WEBHOOK_SECRET: local-webhook-secret
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      <<: *service_env
+    command: uvicorn payment.entrypoints.api.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  relay:
+    build: .
+    environment:
+      <<: *service_env
+    command: python -m payment.entrypoints.relay.runner
+    restart: on-failure
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  consumer:
+    build: .
+    environment:
+      <<: *service_env
+    command: python -m payment.entrypoints.consumer.app
+    restart: on-failure
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

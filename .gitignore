@@ -1,0 +1,36 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Тесты и тулинг
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Окружение и секреты
+.env
+.env.*
+!.env.example
+AGENTS.md
+.superpowers/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Мусор
+*.log
+*.tmp
+
+# Схемы (не публикуем: ни исходник, ни рендер)
+docs/*.excalidraw
+docs/*.png
