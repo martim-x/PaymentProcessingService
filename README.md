@@ -18,9 +18,12 @@ consumer эмулирует шлюз (2–5 сек, 90/10), обновляет �
 ## Быстрый старт
 
 ```bash
-cp .env.example .env   # при необходимости поправьте значения
+cp .env.example .env   # замените обязательные API- и webhook-секреты
 docker compose up --build
 ```
+
+Если `.env` отсутствует, Compose использует `local-dev-key` и `local-webhook-secret`.
+Это только локальные значения для разработки; не используйте их на публичном стенде.
 
 Поднимаются: postgres, rabbitmq (+UI), api, relay (outbox publisher), consumer;
 миграции применяются автоматически.
@@ -103,8 +106,8 @@ PY
 | **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж; `relay` (поллинг `outbox WHERE sent=false`, `FOR UPDATE SKIP LOCKED`) публикует в `payments.new` и помечает sent |
 | **Идемпотентность** | Уникальный `idempotency_key` + fingerprint тела (sha256 канонического JSON, каноническая сумма: `100.5 ≡ 100.50`). Fingerprint считается в use case, а не в HTTP-слое; `IntegrityError` ловится в репозитории и превращается в `IdempotencyViolation`. Повтор → тот же платёж, конфликт → 409 |
 | **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3. Счётчик попыток едет в заголовке `x-attempt` (x-death теряется при перепубликации) |
-| **Клейм обработки** | Перед вызовом шлюза: `UPDATE ... SET locked_until = now() + PAYMENT_CLAIM_TTL_SECONDS WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())`. Дубликат сообщения клейм не получит → **двойного списания нет**. При любом сбое после клейма он **снимается** (`release_claim` по токену), поэтому ретраи не истекают впустую. Если клейм занят, а платёж ещё `pending` — бросается `PaymentBusy`, сообщение идёт по retry/DLQ (не ack'ается молча). В шлюз дополнительно передаётся `idempotency_key` |
-| **Клейм и тайминги** | `PAYMENT_CLAIM_TTL_SECONDS` (30 с) покрывает шлюз (`PAYMENT_PROCESS_MAX_SECONDS`) + финализацию; от «медленного шлюза» дополнительно защищает `idempotency_key`. Дубликат сообщения ждёт освобождения клейма до `PAYMENT_CLAIM_WAIT_SECONDS` (15 с) и, если платёж стал финальным, тихо завершается — без retry-шума и DLQ |
+| **Клейм обработки** | Перед вызовом шлюза: `UPDATE ... SET locked_until = now() + PAYMENT_CLAIM_TTL_SECONDS WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())`. Клейм не даёт двум consumer'ам одновременно обрабатывать платёж, пока он действителен. Защита от повторного списания после истечения клейма/сбоя зависит от поддержки и соблюдения `idempotency_key` внешним шлюзом; fake gateway не моделирует реальные списания. При любом сбое после клейма он **снимается** (`release_claim` по токену). Если клейм занят, а платёж ещё `pending` — бросается `PaymentBusy`, сообщение идёт по retry/DLQ (не ack'ается молча). В шлюз передаётся ключ платежа |
+| **Клейм и тайминги** | `PAYMENT_CLAIM_TTL_SECONDS` (30 с) покрывает эмулируемый шлюз (`PAYMENT_PROCESS_MAX_SECONDS`) + финализацию. При реальном шлюзе защита от повторного списания при превышении TTL должна обеспечиваться самим провайдером по `idempotency_key`; fake gateway не моделирует это поведение. Дубликат сообщения ждёт освобождения клейма до `PAYMENT_CLAIM_WAIT_SECONDS` (15 с) и, если платёж стал финальным, тихо завершается — без retry-шума и DLQ |
 | **Согласованность клейма и ретраев** | Настройки проверяются на старте: `claim_ttl_seconds ≤ retry_wait_budget`, где бюджет = `max_attempts × claim_wait_seconds + TTL retry-очередей`. Иначе при `kill -9` consumer'а (клейм не снимается) все попытки истекут раньше, чем клейм протухнет, и сообщение уйдёт в DLQ с платежом в `pending`. Проверяется и нижняя граница: `claim_ttl_seconds ≥ PAYMENT_PROCESS_MAX_SECONDS + PAYMENT_CLAIM_FINALIZE_MARGIN_SECONDS` (иначе клейм короче шлюза), и строгий запас: `TTL + 2 × PAYMENT_CLAIM_POLL_SECONDS < бюджет`. С дефолтами TTL 30 с, бюджет 48 с — дубликат перехватывает клейм и доводит платёж до финала |
 | **Недоступность брокера** | `PublisherUnavailable` (соединение/канал) **не считается попыткой записи**: батч прерывается, уже опубликованное коммитится, `attempts` не растёт. Иначе рестарт RabbitMQ на 10 секунд «сжёг» бы лимит и все записи ушли бы в `failed` |
 | **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у записи растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не мешает остальным |
@@ -113,8 +116,10 @@ PY
 
 ## Безопасность
 
-- **Секреты обязательны**: `PAYMENT_API_KEY` и `PAYMENT_WEBHOOK_SECRET` не имеют рабочих
-  дефолтов — сервис падает при старте с пустым/заглушечным значением.
+- **Секреты обязательны вне локального Compose**: приложение отвергает пустые и известные
+  заглушечные значения `PAYMENT_API_KEY` / `PAYMENT_WEBHOOK_SECRET`. Compose без `.env`
+  подставляет только локальные значения для разработки (см. быстрый старт); их нельзя
+  использовать на публичном стенде.
 - **Сравнение API-ключа** — `hmac.compare_digest` (константное время).
 - **SSRF-гард**: `webhook_url` проверяется перед отправкой — блокируются loopback,
   приватные, link-local и зарезервированные адреса (после DNS-резолва).

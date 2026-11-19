@@ -23,10 +23,15 @@ class Money:
     def __post_init__(self) -> None:
         if not isinstance(self.amount, Decimal):
             raise InvalidMoney(self.amount, "amount must be Decimal")
-        if self.amount <= 0:
+        if not self.amount.is_finite() or self.amount <= 0:
             raise InvalidMoney(self.amount, "amount must be positive")
         # нормализация точности до 4 знаков (Numeric(19,4) в БД)
-        quantized = self.amount.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
+        try:
+            quantized = self.amount.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
+        except InvalidOperation as exc:
+            raise InvalidMoney(self.amount, "amount exceeds the supported precision") from exc
+        if quantized <= 0:
+            raise InvalidMoney(self.amount, "amount rounds to zero at the supported precision")
         if quantized > _MONEY_MAX:
             raise InvalidMoney(self.amount, "amount exceeds the supported maximum")
         object.__setattr__(self, "amount", quantized)
