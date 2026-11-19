@@ -50,14 +50,44 @@ class Settings(BaseSettings):
     retry_base_delay: float = 1.0
     retry_factor: float = 2.0
 
-    # Клейм обработки платежа: дольше, чем шлюз + webhook-ретраи
-    claim_ttl_seconds: float = 60.0
+    # Клейм обработки платежа: страхует от зависшего consumer'а.
+    # TTL покрывает шлюз (process_max) + финализацию с запасом.
+    claim_ttl_seconds: float = 30.0
     # сколько ждать освобождения клейма дубликату сообщения (до retry/DLQ)
     claim_wait_seconds: float = 15.0
     # Сколько раз relay пытается опубликовать «ядовитую» запись outbox
     outbox_max_attempts: int = 10
     # Prefetch consumer'а: сколько сообщений он берёт из очереди одновременно
     consumer_prefetch: int = 10
+
+    @property
+    def retry_wait_budget(self) -> float:
+        """Сколько секунд дубликат в сумме может ждать истечения клейма.
+
+        max_attempts ожиданий по claim_wait_seconds + TTL retry-очередей
+        между попытками. Бюджет обязан покрывать claim_ttl_seconds, иначе при
+        жёстком падении consumer'а все попытки истекут раньше, чем клейм
+        освободится, и сообщение уйдёт в DLQ с платежом в pending.
+        """
+        waits = self.max_attempts * self.claim_wait_seconds
+        delays = sum(
+            self.retry_base_delay * (self.retry_factor**i) for i in range(self.max_attempts - 1)
+        )
+        return waits + delays
+
+    @model_validator(mode="after")
+    def _check_claim_budget(self) -> "Settings":
+        if self.claim_ttl_seconds > self.retry_wait_budget:
+            raise ValueError(
+                "PAYMENT_CLAIM_TTL_SECONDS "
+                f"({self.claim_ttl_seconds}) exceeds the duplicate-wait budget "
+                f"({self.retry_wait_budget:.1f}s = {self.max_attempts} x "
+                f"PAYMENT_CLAIM_WAIT_SECONDS + retry TTLs): a duplicate would exhaust "
+                "all retries before the stale claim expires and the payment would "
+                "stay pending. Increase PAYMENT_CLAIM_WAIT_SECONDS or lower "
+                "PAYMENT_CLAIM_TTL_SECONDS."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_secrets(self) -> "Settings":
