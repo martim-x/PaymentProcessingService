@@ -112,7 +112,7 @@ jobs:
         env:
           PAYMENT_API_URL: http://localhost:8000
           PAYMENT_API_KEY: local-dev-key
-      - name: Chaos: SIGKILL consumer'а во время обработки
+      - name: "Chaos: SIGKILL consumer'а во время обработки"
         run: ./scripts/chaos_kill9.sh
         env:
           PAYMENT_API_KEY: local-dev-key

@@ -287,7 +287,8 @@ class TestClaimReleaseOnCancellation:
 
             async def process(self, *, payment_id, amount, currency, idempotency_key=""):
                 self.started.set()
-                await asyncio.sleep(30)  # зависший шлюз
+                # «зависший» шлюз без таймера: корутина живёт до отмены задачи
+                await asyncio.Event().wait()
                 raise AssertionError("unreachable")
 
         gateway = SlowGateway()
