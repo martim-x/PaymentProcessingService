@@ -57,6 +57,7 @@ class Container:
             retry_policy=self.retry_policy,
             claim_ttl_seconds=self.settings.claim_ttl_seconds,
             claim_wait_seconds=self.settings.claim_wait_seconds,
+            claim_poll_seconds=self.settings.claim_poll_seconds,
         )
 
     def publish_outbox(self) -> PublishOutbox:

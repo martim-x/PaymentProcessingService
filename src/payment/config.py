@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     claim_ttl_seconds: float = 30.0
     # сколько ждать освобождения клейма дубликату сообщения (до retry/DLQ)
     claim_wait_seconds: float = 15.0
+    # период опроса клейма ожидающим дубликатом
+    claim_poll_seconds: float = 0.5
+    # запас на финализацию: TTL клейма обязан быть больше process_max на эту величину
+    claim_finalize_margin_seconds: float = 5.0
     # Сколько раз relay пытается опубликовать «ядовитую» запись outbox
     outbox_max_attempts: int = 10
     # Prefetch consumer'а: сколько сообщений он берёт из очереди одновременно
@@ -76,15 +80,32 @@ class Settings(BaseSettings):
         return waits + delays
 
     @model_validator(mode="after")
+    def _check_claim_lower_bound(self) -> "Settings":
+        minimum = self.process_max_seconds + self.claim_finalize_margin_seconds
+        if self.claim_ttl_seconds < minimum:
+            raise ValueError(
+                "PAYMENT_CLAIM_TTL_SECONDS "
+                f"({self.claim_ttl_seconds}) must be at least "
+                f"PAYMENT_PROCESS_MAX_SECONDS + margin ({minimum}s): a shorter claim "
+                "lets a second consumer steal the payment from a consumer that is "
+                "still talking to the gateway; only the gateway idempotency key "
+                "would prevent a double charge."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_claim_budget(self) -> "Settings":
-        if self.claim_ttl_seconds > self.retry_wait_budget:
+        safety = 2 * self.claim_poll_seconds
+        # строгое неравенство: бюджет обязан превышать TTL хотя бы на два опроса
+        if not self.claim_ttl_seconds + safety < self.retry_wait_budget:
             raise ValueError(
                 "PAYMENT_CLAIM_TTL_SECONDS "
                 f"({self.claim_ttl_seconds}) exceeds the duplicate-wait budget "
                 f"({self.retry_wait_budget:.1f}s = {self.max_attempts} x "
                 f"PAYMENT_CLAIM_WAIT_SECONDS + retry TTLs): a duplicate would exhaust "
                 "all retries before the stale claim expires and the payment would "
-                "stay pending. Increase PAYMENT_CLAIM_WAIT_SECONDS or lower "
+                "stay pending. The budget must exceed the TTL by at least two poll "
+                "intervals: increase PAYMENT_CLAIM_WAIT_SECONDS or lower "
                 "PAYMENT_CLAIM_TTL_SECONDS."
             )
         return self
