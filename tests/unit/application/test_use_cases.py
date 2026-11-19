@@ -183,7 +183,11 @@ class TestProcessPayment:
         gateway = FakeGateway(succeed=True)
         webhook = FakeWebhookSender()
         use_case = ProcessPayment(
-            uow=uow, gateway=gateway, webhook_sender=webhook, retry_policy=fast_policy()
+            uow=uow,
+            gateway=gateway,
+            webhook_sender=webhook,
+            retry_policy=fast_policy(),
+            claim_wait_seconds=0.0,  # без ожидания: проверяем именно ветку PaymentBusy
         )
 
         # занято другим consumer'ом -> исключение (retry), а не молчаливый ack
@@ -261,7 +265,114 @@ class TestClaimFailureHandling:
             gateway=FakeGateway(succeed=True),
             webhook_sender=FakeWebhookSender(),
             retry_policy=fast_policy(),
+            claim_wait_seconds=0.0,  # без ожидания: тест на ветку PaymentBusy
         )
 
         with pytest.raises(PaymentBusy):
             await use_case.execute(pid)
+
+
+class TestClaimReleaseOnCancellation:
+    """SIGTERM -> CancelledError (BaseException): клейм обязан сняться сразу."""
+
+    async def test_claim_released_when_task_cancelled(self) -> None:
+        import asyncio
+
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+
+        class SlowGateway:
+            started = asyncio.Event()
+
+            async def process(self, *, payment_id, amount, currency, idempotency_key=""):
+                self.started.set()
+                await asyncio.sleep(30)  # зависший шлюз
+                raise AssertionError("unreachable")
+
+        gateway = SlowGateway()
+        use_case = ProcessPayment(
+            uow=uow, gateway=gateway, webhook_sender=FakeWebhookSender(), retry_policy=fast_policy()
+        )
+
+        task = asyncio.create_task(use_case.execute(pid))
+        await gateway.started.wait()
+        assert str(pid) in uow.payments.claimed  # клейм взят
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # клейм снят, хотя исключение — BaseException, а не Exception
+        assert str(pid) not in uow.payments.claimed
+
+
+class TestClaimWaiting:
+    """Дубликат дожидается освобождения клейма вместо сжигания retry-попыток."""
+
+    async def test_duplicate_waits_and_then_processes(self) -> None:
+        import asyncio
+
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+        uow.payments.claimed.add(str(pid))  # первый consumer в работе
+
+        async def release_soon() -> None:
+            await asyncio.sleep(0.05)
+            uow.payments.claimed.discard(str(pid))
+
+        asyncio.create_task(release_soon())
+        gateway = FakeGateway(succeed=True)
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=gateway,
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+            claim_wait_seconds=1.0,
+            claim_poll_seconds=0.01,
+        )
+
+        outcome = await use_case.execute(pid)
+
+        assert outcome.status == "succeeded"
+        assert gateway.calls == 1
+
+    async def test_duplicate_gives_up_after_wait(self) -> None:
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+        uow.payments.claimed.add(str(pid))
+
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+            claim_wait_seconds=0.05,
+            claim_poll_seconds=0.01,
+        )
+
+        with pytest.raises(PaymentBusy):
+            await use_case.execute(pid)
+
+    async def test_terminal_payment_returns_instead_of_waiting(self) -> None:
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+        # платёж уже обработан другим consumer'ом
+        created.payment.mark_succeeded()
+        uow.payments.finalized_elsewhere.add(str(pid))
+
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+            claim_wait_seconds=5.0,
+            claim_poll_seconds=0.01,
+        )
+
+        outcome = await use_case.execute(pid)
+
+        assert outcome.status == "succeeded"
