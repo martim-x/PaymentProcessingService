@@ -33,6 +33,10 @@ class PaymentRepository(Protocol):
         """
         ...
 
+    async def release_claim(self, payment_id: PaymentId, claim_token: datetime) -> None:
+        """Снимает клейм, если он всё ещё принадлежит claim_token."""
+        ...
+
     async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
         """Атомарно фиксирует финальный статус под клеймом claim_token.
 

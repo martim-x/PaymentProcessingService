@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 
 from payment.application.dto import CreatePaymentCommand
-from payment.application.exceptions import IdempotencyConflict, PaymentNotFound
+from payment.application.exceptions import IdempotencyConflict, PaymentBusy, PaymentNotFound
 from payment.application.use_cases.create_payment import CreatePayment
 from payment.application.use_cases.process_payment import ProcessPayment
 from payment.domain.model.enums import Currency
@@ -186,11 +186,12 @@ class TestProcessPayment:
             uow=uow, gateway=gateway, webhook_sender=webhook, retry_policy=fast_policy()
         )
 
-        outcome = await use_case.execute(pid)
+        # занято другим consumer'ом -> исключение (retry), а не молчаливый ack
+        with pytest.raises(PaymentBusy):
+            await use_case.execute(pid)
 
         assert gateway.calls == 0
         assert webhook.calls == 0
-        assert outcome.status == "pending"
 
     async def test_gateway_receives_idempotency_key(self) -> None:
         uow = FakeUnitOfWork()
@@ -215,3 +216,52 @@ class TestProcessPayment:
 
         with pytest.raises(PaymentNotFound):
             await use_case.execute(PaymentId.next())
+
+
+class TestClaimFailureHandling:
+    """Главный failure mode: сбой после клейма не должен «съесть» все ретраи."""
+
+    async def test_claim_released_when_gateway_fails(self) -> None:
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+
+        failing_gateway = FakeGateway(fail_times=1)
+        first = ProcessPayment(
+            uow=uow,
+            gateway=failing_gateway,
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+        )
+
+        with pytest.raises(RuntimeError, match="temporarily unavailable"):
+            await first.execute(pid)
+
+        # клейм снят — повторная попытка снова может взять платёж
+        second_gateway = FakeGateway(succeed=True)
+        second = ProcessPayment(
+            uow=uow,
+            gateway=second_gateway,
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+        )
+        outcome = await second.execute(pid)
+
+        assert outcome.status == "succeeded"
+        assert second_gateway.calls == 1
+
+    async def test_busy_claim_raises_instead_of_silent_ack(self) -> None:
+        uow = FakeUnitOfWork()
+        created = await CreatePayment(uow=uow).execute(command())
+        pid = created.payment.id
+        uow.payments.claimed.add(str(pid))  # другой consumer держит клейм
+
+        use_case = ProcessPayment(
+            uow=uow,
+            gateway=FakeGateway(succeed=True),
+            webhook_sender=FakeWebhookSender(),
+            retry_policy=fast_policy(),
+        )
+
+        with pytest.raises(PaymentBusy):
+            await use_case.execute(pid)

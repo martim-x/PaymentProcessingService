@@ -4,10 +4,11 @@ import asyncio
 import logging
 
 from payment.application.dto import ProcessPaymentResult
-from payment.application.exceptions import PaymentNotFound
+from payment.application.exceptions import PaymentBusy, PaymentNotFound
 from payment.application.ports.payment_gateway import GatewayResult, PaymentGateway
 from payment.application.ports.repositories import AbstractUnitOfWork
 from payment.application.ports.webhook_sender import WebhookSender
+from payment.domain.model.enums import PaymentStatus
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import PaymentId
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
@@ -22,8 +23,11 @@ class ProcessPayment:
       `UPDATE ... SET locked_until = now() + ttl WHERE status='pending' AND
       (locked_until IS NULL OR locked_until < now())`. Дубликат сообщения
       клейм не получит, поэтому списание не повторится;
-    - клейм истекает (PAYMENT_CLAIM_TTL), поэтому упавший consumer не
-      блокирует платёж навсегда — повторное сообщение переклеймит его;
+    - при любом сбое после клейма он СНИМАЕТСЯ (`release_claim`), иначе
+      ретраи (TTL 1–2 с) истекут раньше клейма (60 с) и платёж зависнет в
+      `pending` без единой попытки — это и есть главный failure mode;
+    - если клейм занят другим consumer'ом, а платёж ещё `pending` — бросаем
+      `PaymentBusy`: сообщение идёт по retry/DLQ, а не ack'ается молча;
     - в шлюз передаётся idempotency_key (id платежа) — второй рубеж защиты;
     - шлюз вызывается ВНЕ транзакции, финальный статус фиксируется условным
       UPDATE под токеном клейма;
@@ -48,26 +52,32 @@ class ProcessPayment:
     async def execute(self, payment_id: PaymentId) -> ProcessPaymentResult:
         claim_token = await self._claim(payment_id)
         if claim_token is None:
-            # платёж уже финализирован или прямо сейчас обрабатывается дубликатом
             payment = await self._load(payment_id)
-            logger.info(
-                "payment %s: claim not acquired (status=%s)", payment_id, payment.status.value
+            if payment.status is not PaymentStatus.PENDING:
+                # платёж уже финализирован — дубликат сообщения можно ack'ать
+                return self._result(payment)
+            # платёж ещё pending, но клейм у другого consumer'а:
+            # молча ack'ать нельзя — иначе при его падении не останется попыток
+            raise PaymentBusy(str(payment_id))
+
+        try:
+            payment = await self._load(payment_id)
+            result: GatewayResult = await self._gateway.process(
+                payment_id=str(payment.id),
+                amount=payment.amount.amount,
+                currency=payment.amount.currency.value,
+                idempotency_key=str(payment.id),
             )
-            return self._result(payment)
+            payment.mark_succeeded() if result.succeeded else payment.mark_failed(
+                reason=result.reason or "gateway rejected the payment"
+            )
+            payment.collect_events()  # события домена не имеют подписчиков
+            won = await self._finalize(payment, claim_token)
+        except Exception:
+            # снимаем клейм, чтобы ретрай снова смог взять платёж в работу
+            await self._release_claim(payment_id, claim_token)
+            raise
 
-        payment = await self._load(payment_id)
-        result: GatewayResult = await self._gateway.process(
-            payment_id=str(payment.id),
-            amount=payment.amount.amount,
-            currency=payment.amount.currency.value,
-            idempotency_key=str(payment.id),
-        )
-        payment.mark_succeeded() if result.succeeded else payment.mark_failed(
-            reason=result.reason or "gateway rejected the payment"
-        )
-        payment.collect_events()  # события домена не имеют подписчиков — просто очищаем буфер
-
-        won = await self._finalize(payment, claim_token)
         if not won:
             logger.info("payment %s: claim expired or already finalized", payment.id)
             return self._result(payment)
@@ -80,6 +90,14 @@ class ProcessPayment:
             token = await uow.payments.try_claim(payment_id, self._claim_ttl)
             await uow.commit()
         return token
+
+    async def _release_claim(self, payment_id: PaymentId, claim_token) -> None:
+        try:
+            async with self._uow as uow:
+                await uow.payments.release_claim(payment_id, claim_token)
+                await uow.commit()
+        except Exception:  # noqa: BLE001 — снятие клейма не должно маскировать исходную ошибку
+            logger.exception("failed to release claim for payment %s", payment_id)
 
     async def _load(self, payment_id: PaymentId) -> Payment:
         async with self._uow as uow:

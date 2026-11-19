@@ -2,7 +2,7 @@
 
 import logging
 
-from payment.application.ports.message_publisher import MessagePublisher
+from payment.application.ports.message_publisher import MessagePublisher, PublisherUnavailable
 from payment.application.ports.repositories import AbstractUnitOfWork
 
 logger = logging.getLogger(__name__)
@@ -15,9 +15,10 @@ class PublishOutbox:
       обрабатывается отдельно, сбойная получает +1 к attempts;
     - после max_attempts сбойная запись помечается failed (dead-letter
       на уровне outbox) и больше не блокирует очередь;
-    - если лёг брокер, все записи батча получат +1 к attempts — это
-      ожидаемый ретрай на следующем проходе, поэтому max_attempts должен
-      быть заметно больше, чем «сколько раз подряд может лежать брокер».
+    - недоступность брокера (`PublisherUnavailable`) НЕ считается попыткой
+      записи: батч прерывается, уже опубликованное коммитится, остальные
+      ждут следующего прохода. Иначе рестарт RabbitMQ на N секунд
+      «сожжёт» max_attempts и все записи навсегда уйдут в failed.
     """
 
     def __init__(
@@ -43,6 +44,16 @@ class PublishOutbox:
                     await self._publisher.publish(subject=self._subject, payload=record.payload)
                     await uow.outbox.mark_sent(record.id)
                     published += 1
+                except PublisherUnavailable:
+                    # брокер лежит: попытки записи не тратим, коммитим успешные
+                    if published:
+                        await uow.commit()
+                    logger.warning(
+                        "broker unavailable; %d record(s) published, %d left for next pass",
+                        published,
+                        len(records) - published,
+                    )
+                    raise
                 except Exception:  # noqa: BLE001 — одна запись не должна ронять батч
                     dead = await uow.outbox.mark_attempt_failed(record.id, self._max_attempts)
                     failed += 1

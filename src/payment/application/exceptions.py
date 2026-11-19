@@ -5,6 +5,10 @@ class ApplicationError(Exception):
     """Базовое исключение application-слоя."""
 
 
+class PaymentBusy(ApplicationError):
+    """Платёж в работе у другого consumer'а: сообщение должно уйти в retry, а не ack."""
+
+
 class PaymentNotFound(ApplicationError):
     def __init__(self, payment_id: str) -> None:
         self.payment_id = payment_id
