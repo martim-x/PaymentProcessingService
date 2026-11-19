@@ -54,6 +54,14 @@ psql_value() {
     -c "SELECT $1 FROM payments WHERE id = '$PAYMENT_ID';"
 }
 
+dlq_count() {
+  docker exec payment-service-rabbitmq-1 rabbitmqctl list_queues name messages 2>/dev/null \
+    | awk '$1 == "payments.dlq" {print $2+0}'
+}
+
+DLQ_BEFORE="$(dlq_count || echo 0)"
+echo "==> payments.dlq до сценария: ${DLQ_BEFORE:-0}"
+
 echo "==> consumer с медленным шлюзом (${GATEWAY_SECONDS}s)"
 docker compose -f docker-compose.yml -f "$OVERRIDE" up -d --no-deps consumer >/dev/null
 sleep 4
@@ -87,9 +95,9 @@ echo "==> docker kill --signal=KILL $CONSUMER"
 docker kill --signal=KILL "$CONSUMER" >/dev/null
 
 sleep 1
-eLOST="$(psql_value 'locked_until IS NOT NULL')"
-echo "==> после SIGKILL: клейм остался=$eLOST (release_claim не выполнялся)"
-[ "$eLOST" = "t" ] || fail "клейм исчез — сценарий не воспроизвёл жёсткое падение"
+LOCKED_AFTER="$(psql_value 'locked_until IS NOT NULL')"
+echo "==> после SIGKILL: клейм остался=$LOCKED_AFTER (release_claim не выполнялся)"
+[ "$LOCKED_AFTER" = "t" ] || fail "клейм исчез — сценарий не воспроизвёл жёсткое падение"
 
 echo "==> поднимаю consumer заново, жду перехвата клейма (до ${TIMEOUT_SECONDS}s)"
 docker compose -f docker-compose.yml -f "$OVERRIDE" start consumer >/dev/null
@@ -105,10 +113,11 @@ done
 [ "$STATUS" != "pending" ] || fail "платёж остался pending спустя ${TIMEOUT_SECONDS}s"
 CLEARED="$(psql_value 'locked_until IS NULL')"
 echo "==> итог: status=$STATUS, клейм снят=$CLEARED"
+[ "$CLEARED" = "t" ] || fail "клейм не снят после финализации (locked_until остался)"
 
-DLQ="$(docker exec payment-service-rabbitmq-1 rabbitmqctl list_queues name messages 2>/dev/null \
-  | awk '$1 == "payments.dlq" {print $2}')"
-echo "==> payments.dlq messages=${DLQ:-0}"
-[ "${DLQ:-0}" = "0" ] || fail "сообщение ушло в DLQ — перехват клейма не сработал"
+DLQ_AFTER="$(dlq_count || echo 0)"
+echo "==> payments.dlq: было ${DLQ_BEFORE:-0}, стало ${DLQ_AFTER:-0}"
+[ "${DLQ_AFTER:-0}" = "${DLQ_BEFORE:-0}" ] \
+  || fail "в DLQ добавились сообщения — перехват клейма не сработал"
 
-echo "PASS: платёж $PAYMENT_ID дошёл до $STATUS после SIGKILL, DLQ пуст"
+echo "PASS: платёж $PAYMENT_ID дошёл до $STATUS после SIGKILL; клейм снят, новых записей в DLQ нет"
