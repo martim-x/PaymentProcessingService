@@ -74,6 +74,16 @@ class SqlAlchemyPaymentRepository:
         row = result.first()
         return row.locked_until if row is not None else None
 
+    async def release_claim(self, payment_id: PaymentId, claim_token: datetime) -> None:
+        await self._session.execute(
+            update(payments_table)
+            .where(
+                payments_table.c.id == payment_id.value,
+                payments_table.c.locked_until == claim_token,
+            )
+            .values(locked_until=None)
+        )
+
     async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
         """UPDATE под клеймом: id + pending + locked_until = токен."""
         result = await self._session.execute(

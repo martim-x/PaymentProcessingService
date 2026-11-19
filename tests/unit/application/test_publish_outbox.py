@@ -1,5 +1,8 @@
 """Use case: PublishOutbox — публикация батча с изоляцией «ядовитых» записей."""
 
+import pytest
+
+from payment.application.ports.message_publisher import PublisherUnavailable
 from payment.application.use_cases.publish_outbox import PublishOutbox
 from tests.fakes import FakeMessagePublisher, FakeUnitOfWork
 
@@ -72,3 +75,47 @@ class TestPublishOutbox:
         published = await use_case.execute(batch=10)
 
         assert published == 0
+
+
+class TestBrokerOutage:
+    """Недоступность брокера не должна «сжигать» лимит попыток записей."""
+
+    async def test_outage_does_not_increment_attempts(self) -> None:
+        uow = FakeUnitOfWork()
+        await uow.outbox.add(payload={"n": 1}, aggregate_id="a1")
+        await uow.outbox.add(payload={"n": 2}, aggregate_id="a2")
+        publisher = FakeMessagePublisher(unavailable_first=99)
+        use_case = PublishOutbox(uow=uow, publisher=publisher, max_attempts=2)
+
+        with pytest.raises(PublisherUnavailable):
+            await use_case.execute(batch=10)
+
+        unsent = await uow.outbox.fetch_unsent(batch=10)
+        assert len(unsent) == 2  # записи на месте
+        assert all(r.attempts == 0 for r in unsent)  # попытки не потрачены
+        assert all(r.failed is False for r in unsent)
+
+    async def test_partial_batch_is_committed_before_outage(self) -> None:
+        uow = FakeUnitOfWork()
+        await uow.outbox.add(payload={"n": 1}, aggregate_id="a1")
+        await uow.outbox.add(payload={"n": 2}, aggregate_id="a2")
+        # первая публикация успешна, вторая падает по недоступности брокера
+        publisher = FakeMessagePublisher(unavailable_first=0)
+        calls = {"n": 0}
+        original = publisher.publish
+
+        async def publish_then_die(*, subject, payload):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise PublisherUnavailable("broker is down")
+            await original(subject=subject, payload=payload)
+
+        publisher.publish = publish_then_die
+        use_case = PublishOutbox(uow=uow, publisher=publisher, max_attempts=2)
+
+        with pytest.raises(PublisherUnavailable):
+            await use_case.execute(batch=10)
+
+        unsent = await uow.outbox.fetch_unsent(batch=10)
+        assert [r.payload["n"] for r in unsent] == [2]
+        assert unsent[0].attempts == 0

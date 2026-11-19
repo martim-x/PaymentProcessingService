@@ -51,6 +51,9 @@ class FakePaymentRepository:
         self.claimed.add(key)
         return datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
 
+    async def release_claim(self, payment_id, claim_token) -> None:
+        self.claimed.discard(str(payment_id))
+
     async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
         key = str(payment.id)
         if key in self.finalized_elsewhere:
@@ -140,9 +143,16 @@ class FakeUnitOfWork:
 class FakeGateway:
     """Эмулирует шлюз: результат задаётся заранее."""
 
-    def __init__(self, *, succeed: bool = True, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        succeed: bool = True,
+        reason: str | None = None,
+        fail_times: int = 0,
+    ) -> None:
         self.succeed = succeed
         self.reason = reason
+        self.fail_times = fail_times  # первые N вызовов падают исключением
         self.calls = 0
         self.last_idempotency_key = ""
 
@@ -156,6 +166,8 @@ class FakeGateway:
     ) -> GatewayResult:
         self.calls += 1
         self.last_idempotency_key = idempotency_key
+        if self.calls <= self.fail_times:
+            raise RuntimeError("gateway is temporarily unavailable")
         return GatewayResult(succeeded=self.succeed, reason=self.reason)
 
 
@@ -177,14 +189,25 @@ class FakeWebhookSender:
 
 
 class FakeMessagePublisher:
-    def __init__(self, *, fail_first: int = 0, poison_payload: dict | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_first: int = 0,
+        poison_payload: dict | None = None,
+        unavailable_first: int = 0,
+    ) -> None:
         self.published: list[tuple[str, dict[str, Any]]] = []
         self.fail_first = fail_first
         self.poison_payload = poison_payload
+        self.unavailable_first = unavailable_first
         self._calls = 0
 
     async def publish(self, *, subject: str, payload: dict[str, Any]) -> None:
+        from payment.application.ports.message_publisher import PublisherUnavailable
+
         self._calls += 1
+        if self._calls <= self.unavailable_first:
+            raise PublisherUnavailable("broker is down")
         if self.poison_payload is not None and payload == self.poison_payload:
             raise RuntimeError("publish rejected for this payload")
         if self._calls <= self.fail_first:

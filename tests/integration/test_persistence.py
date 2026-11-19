@@ -191,6 +191,33 @@ class TestProcessPaymentPersistStatus:
         assert right is True
         assert again is False
 
+    async def test_release_claim_only_with_own_token(self, uow_factory) -> None:
+        payment = make_payment("key-proc-5")
+        async with uow_factory() as w:
+            await w.payments.add(payment)
+            await w.commit()
+
+        async with uow_factory() as w:
+            token = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+
+        # чужой токен не снимает клейм
+        async with uow_factory() as w:
+            await w.payments.release_claim(payment.id, token.replace(year=1999, microsecond=1))
+            await w.commit()
+        async with uow_factory() as w:
+            still_locked = await w.payments.try_claim(payment.id, ttl_seconds=60)
+        assert still_locked is None
+
+        # свой токен снимает — платёж снова доступен
+        async with uow_factory() as w:
+            await w.payments.release_claim(payment.id, token)
+            await w.commit()
+        async with uow_factory() as w:
+            reclaimed = await w.payments.try_claim(payment.id, ttl_seconds=60)
+            await w.commit()
+        assert reclaimed is not None
+
     async def test_expired_claim_can_be_reacquired(self, uow_factory) -> None:
         payment = make_payment("key-proc-4")
         async with uow_factory() as w:
