@@ -52,6 +52,8 @@ class Settings(BaseSettings):
 
     # Клейм обработки платежа: дольше, чем шлюз + webhook-ретраи
     claim_ttl_seconds: float = 60.0
+    # сколько ждать освобождения клейма дубликату сообщения (до retry/DLQ)
+    claim_wait_seconds: float = 15.0
     # Сколько раз relay пытается опубликовать «ядовитую» запись outbox
     outbox_max_attempts: int = 10
     # Prefetch consumer'а: сколько сообщений он берёт из очереди одновременно

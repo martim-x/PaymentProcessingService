@@ -56,6 +56,7 @@ class Container:
             webhook_sender=self.webhook_sender,
             retry_policy=self.retry_policy,
             claim_ttl_seconds=self.settings.claim_ttl_seconds,
+            claim_wait_seconds=self.settings.claim_wait_seconds,
         )
 
     def publish_outbox(self) -> PublishOutbox:

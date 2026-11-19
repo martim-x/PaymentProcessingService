@@ -42,15 +42,19 @@ class ProcessPayment:
         webhook_sender: WebhookSender,
         retry_policy: ExponentialBackoffRetryPolicy | None = None,
         claim_ttl_seconds: float = 60.0,
+        claim_wait_seconds: float = 15.0,
+        claim_poll_seconds: float = 0.5,
     ) -> None:
         self._uow = uow
         self._gateway = gateway
         self._webhook_sender = webhook_sender
         self._retry_policy = retry_policy or ExponentialBackoffRetryPolicy()
         self._claim_ttl = claim_ttl_seconds
+        self._claim_wait = claim_wait_seconds
+        self._claim_poll = claim_poll_seconds
 
     async def execute(self, payment_id: PaymentId) -> ProcessPaymentResult:
-        claim_token = await self._claim(payment_id)
+        claim_token = await self._acquire_claim(payment_id)
         if claim_token is None:
             payment = await self._load(payment_id)
             if payment.status is not PaymentStatus.PENDING:
@@ -73,8 +77,10 @@ class ProcessPayment:
             )
             payment.collect_events()  # события домена не имеют подписчиков
             won = await self._finalize(payment, claim_token)
-        except Exception:
-            # снимаем клейм, чтобы ретрай снова смог взять платёж в работу
+        except BaseException:
+            # BaseException, а не Exception: при SIGTERM в обработчик приходит
+            # CancelledError (наследник BaseException). Клейм снимаем и в этом
+            # случае, чтобы ретраю не пришлось ждать TTL; исключение пробрасываем.
             await self._release_claim(payment_id, claim_token)
             raise
 
@@ -85,6 +91,29 @@ class ProcessPayment:
         await self._notify(payment)
         return self._result(payment)
 
+    async def _acquire_claim(self, payment_id: PaymentId):
+        """Берёт клейм, коротко дожидаясь его освобождения.
+
+        Дубликат сообщения обычно приходит во время работы первого consumer'а:
+        мгновенный PaymentBusy сжёг бы все retry-попытки и отправил сообщение
+        в DLQ, хотя платёж успешно обрабатывается. Поэтому ждём до
+        claim_wait_seconds; если платёж стал финальным — возвращаем None.
+        """
+        token = await self._claim(payment_id)
+        if token is not None:
+            return token
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._claim_wait
+        while loop.time() < deadline:
+            await asyncio.sleep(self._claim_poll)
+            token = await self._claim(payment_id)
+            if token is not None:
+                return token
+            payment = await self._load(payment_id)
+            if payment.status is not PaymentStatus.PENDING:
+                return None
+        return None
+
     async def _claim(self, payment_id: PaymentId):
         async with self._uow as uow:
             token = await uow.payments.try_claim(payment_id, self._claim_ttl)
@@ -93,11 +122,15 @@ class ProcessPayment:
 
     async def _release_claim(self, payment_id: PaymentId, claim_token) -> None:
         try:
-            async with self._uow as uow:
-                await uow.payments.release_claim(payment_id, claim_token)
-                await uow.commit()
-        except Exception:  # noqa: BLE001 — снятие клейма не должно маскировать исходную ошибку
+            # shield: снятие клейма не должно быть прервано повторной отменой задачи
+            await asyncio.shield(self._do_release_claim(payment_id, claim_token))
+        except BaseException:  # noqa: BLE001 — не маскируем исходную ошибку/отмену
             logger.exception("failed to release claim for payment %s", payment_id)
+
+    async def _do_release_claim(self, payment_id: PaymentId, claim_token) -> None:
+        async with self._uow as uow:
+            await uow.payments.release_claim(payment_id, claim_token)
+            await uow.commit()
 
     async def _load(self, payment_id: PaymentId) -> Payment:
         async with self._uow as uow:

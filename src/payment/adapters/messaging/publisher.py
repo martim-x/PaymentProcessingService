@@ -31,9 +31,7 @@ _UNAVAILABLE_TYPES: tuple[type[BaseException], ...] = (
     ChannelClosed,
     ChannelInvalidStateError,
     IncorrectState,  # FastStream: публикация в неподключённый брокер
-    ConnectionError,
-    OSError,
-    TimeoutError,
+    OSError,  # ConnectionError и TimeoutError — его подклассы, отдельно не нужны
 )
 
 
