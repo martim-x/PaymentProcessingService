@@ -128,7 +128,7 @@ PY
 
 | Сценарий | Как запустить | Что проверяет |
 |---|---|---|
-| SIGKILL consumer'а посреди обработки | `./scripts/chaos_kill9.sh` | клейм остаётся после `docker kill --signal=KILL`, дубликат дожидается протухания TTL, перехватывает клейм и доводит платёж до финала; DLQ пуст |
+| SIGKILL consumer'а посреди обработки | `./scripts/chaos_kill9.sh` | клейм остаётся после `docker kill --signal=KILL`, дубликат дожидается протухания TTL, перехватывает клейм и доводит платёж до финала; клейм снят, новых записей в DLQ нет (сравнение с числом до сценария) |
 | Полный поток API → outbox → consumer → webhook | `pytest tests/e2e` | 202, идемпотентный повтор, 409, смена статуса, HMAC-подпись от сырых байтов |
 | Outbox против реального PostgreSQL | `pytest tests/integration` | атомарность UoW, claim/finalize/release, poison-записи |
 
