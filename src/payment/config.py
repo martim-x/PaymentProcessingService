@@ -13,6 +13,8 @@ _INSECURE_DEFAULTS = {
     "change-me",
     "change-me-secret-api-key",
     "change-me-webhook-signing-secret",
+    "change-this-api-key",
+    "change-this-webhook-secret",
 }
 
 

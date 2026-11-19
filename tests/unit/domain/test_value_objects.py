@@ -29,6 +29,14 @@ class TestMoney:
         with pytest.raises(InvalidMoney):
             Money(amount=Decimal("-10.00"), currency=Currency.USD)
 
+    def test_rejects_positive_amount_that_rounds_to_zero(self) -> None:
+        with pytest.raises(InvalidMoney):
+            Money(amount=Decimal("0.00001"), currency=Currency.USD)
+
+    def test_rejects_amount_that_cannot_be_quantized(self) -> None:
+        with pytest.raises(InvalidMoney):
+            Money(amount=Decimal("1e1000"), currency=Currency.USD)
+
     def test_normalizes_amount_to_four_digits(self) -> None:
         money = Money(amount=Decimal("10.123456"), currency=Currency.EUR)
 

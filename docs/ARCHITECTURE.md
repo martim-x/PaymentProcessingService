@@ -1,7 +1,7 @@
 # Архитектура Payment Processing Service
 
 Полное описание устройства сервиса: слои, сущности, поток платежа и схема надёжности.
-Смотри также: `ARCHITECTURE.MD` (исходный план структуры), `README.md` (запуск и примеры).
+Запуск и примеры запросов: [`README.md`](../README.md).
 Схема архитектуры — `docs/architecture.excalidraw` (локально, в репозиторий не входит).
 
 
@@ -93,7 +93,7 @@ entrypoints → bootstrap → adapters → application → domain
 - **`consumer/`** — подписчик на `payments.new`. Один обработчик делает всё:
   `ProcessPayment`. Инфраструктурный сбой (БД и т.п.) → публикация в retry-очередь
   `attempt` (TTL) → dead-letter обратно в main; после 3 попыток → `payments.dlq`.
-  Попытка считается по заголовкам `x-death`.
+  Номер попытки передаётся в заголовке `x-attempt`, поскольку retry публикует новое сообщение и `x-death` не сохраняется.
 - **`relay/`** — бесконечный цикл: раз в `PAYMENT_RELAY_INTERVAL` сек пакет outbox
   → RabbitMQ. Корректное завершение по SIGINT/SIGTERM. Политика retry/DLQ —
   в адаптере `adapters/messaging/routing.py`.

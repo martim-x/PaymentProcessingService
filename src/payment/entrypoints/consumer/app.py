@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import signal
+from typing import Any
 
 from faststream.rabbit import RabbitBroker, RabbitMessage
 
@@ -32,6 +33,23 @@ async def _ack(message: RabbitMessage) -> None:
         logger.debug("ack failed", exc_info=True)
 
 
+async def parse_or_quarantine_message(
+    message: RabbitMessage, broker: RabbitBroker, dlq_name: str
+) -> tuple[PaymentCreatedMessage, PaymentId, Any] | None:
+    """Parse a payment event; send malformed or invalid IDs to the DLQ."""
+    raw_payload = message.body
+    try:
+        payload = json.loads(raw_payload) if isinstance(raw_payload, bytes) else raw_payload
+        event = PaymentCreatedMessage.model_validate(payload)
+        payment_id = PaymentId.from_string(event.payment_id)
+    except (TypeError, ValueError):
+        logger.error("poison message -> %s: %r", dlq_name, raw_payload)
+        await broker.publish(raw_payload, queue=dlq_name)
+        await _ack(message)
+        return None
+    return event, payment_id, payload
+
+
 def build_consumer_app(container: Container | None = None) -> RabbitBroker:
     container = container or Container()
     broker = container.get_broker()
@@ -42,20 +60,13 @@ def build_consumer_app(container: Container | None = None) -> RabbitBroker:
 
     @broker.subscriber(main_queue(queue_name, dlq_name), consume_args={"prefetch_count": prefetch})
     async def handle_payment_created(message: RabbitMessage) -> None:
-        use_case: ProcessPayment = container.process_payment()
-        payload = message.body
-        if isinstance(payload, bytes):
-            payload = json.loads(payload)
-        try:
-            event = PaymentCreatedMessage.model_validate(payload)
-        except ValueError:
-            # не наше сообщение — в DLQ, ретраить бессмысленно
-            logger.error("poison message -> %s: %r", dlq_name, payload)
-            await broker.publish(payload, queue=dlq_name)
-            await _ack(message)
+        parsed = await parse_or_quarantine_message(message, broker, dlq_name)
+        if parsed is None:
             return
+        event, payment_id, payload = parsed
+        use_case: ProcessPayment = container.process_payment()
         try:
-            result = await use_case.execute(PaymentId.from_string(event.payment_id))
+            result = await use_case.execute(payment_id)
             logger.info("payment %s processed: %s", event.payment_id, result.status)
         except Exception as exc:  # noqa: BLE001 — инфраструктурный сбой: retry/DLQ
             decision = route_failure(

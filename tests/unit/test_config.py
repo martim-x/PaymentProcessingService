@@ -74,3 +74,16 @@ class TestSecrets:
     def test_default_placeholder_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="PAYMENT_WEBHOOK_SECRET"):
             Settings(api_key="k" * 10, webhook_secret="change-me-webhook-signing-secret")
+
+    @pytest.mark.parametrize(
+        ("api_key", "webhook_secret", "message"),
+        [
+            ("change-this-api-key", "s" * 10, "PAYMENT_API_KEY"),
+            ("k" * 10, "change-this-webhook-secret", "PAYMENT_WEBHOOK_SECRET"),
+        ],
+    )
+    def test_env_example_placeholders_are_rejected(
+        self, api_key: str, webhook_secret: str, message: str
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            Settings(api_key=api_key, webhook_secret=webhook_secret)
