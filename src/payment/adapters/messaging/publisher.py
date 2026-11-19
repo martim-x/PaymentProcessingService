@@ -1,43 +1,46 @@
 """FastStream-реализация MessagePublisher.
 
-Различает два класса ошибок публикации:
-- недоступность транспорта (соединение/канал) → `PublisherUnavailable`:
-  лечится ожиданием, попытки записи outbox не тратятся;
-- отказ конкретной записи (например, сериализация/роутинг) → пробрасывается
-  как есть, и запись получает +1 к attempts.
+Различает два класса ошибок публикации ЯВНЫМ списком типов (без эвристик
+по именам классов — иначе «ядовитая» запись с подходящим именем исключения
+блокировала бы батч на каждом проходе):
+
+- недоступность транспорта (соединение/канал/неподключённый брокер)
+  → `PublisherUnavailable`: лечится ожиданием, попытки записи outbox не тратятся;
+- отказ конкретной записи (`DeliveryError`, `PublishError`, сериализация)
+  → пробрасывается как есть, запись получает +1 к attempts.
 """
 
 from typing import Any
 
-from aio_pika.exceptions import AMQPChannelError, AMQPConnectionError, ConnectionClosed
+from aio_pika.exceptions import (
+    AMQPConnectionError,
+    ChannelClosed,
+    ChannelInvalidStateError,
+    ConnectionClosed,
+)
+from faststream.exceptions import IncorrectState
 from faststream.rabbit import RabbitBroker
 
 from payment.adapters.messaging.topology import MAIN_QUEUE
 from payment.application.ports.message_publisher import MessagePublisher, PublisherUnavailable
 
-# явные классы известных библиотек; ниже — name-based fallback для обёрток faststream
+# только транспортные ошибки: брокер/канал недоступны, ожидание лечит
 _UNAVAILABLE_TYPES: tuple[type[BaseException], ...] = (
     AMQPConnectionError,
-    AMQPChannelError,
     ConnectionClosed,
+    ChannelClosed,
+    ChannelInvalidStateError,
+    IncorrectState,  # FastStream: публикация в неподключённый брокер
     ConnectionError,
     OSError,
     TimeoutError,
 )
-_UNAVAILABLE_NAME_MARKERS = ("Connection", "ChannelInvalidState", "ChannelClosed", "Timeout")
-# отказ доставки конкретного сообщения — это не недоступность брокера
-_PER_RECORD_MARKERS = ("DeliveryError",)
 
 
 def _is_unavailable(exc: BaseException) -> bool:
-    names = " ".join(cls.__name__ for cls in type(exc).__mro__)
-    if any(marker in names for marker in _PER_RECORD_MARKERS):
-        return False
-    if isinstance(exc, _UNAVAILABLE_TYPES):
-        return True
     if isinstance(exc, PublisherUnavailable):
         return True
-    return any(marker in names for marker in _UNAVAILABLE_NAME_MARKERS)
+    return isinstance(exc, _UNAVAILABLE_TYPES)
 
 
 class FastStreamPublisher(MessagePublisher):
