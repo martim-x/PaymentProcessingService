@@ -13,7 +13,24 @@ class TestClaimBudget:
     def test_defaults_satisfy_the_invariant(self) -> None:
         settings = make_settings()
 
-        assert settings.claim_ttl_seconds <= settings.retry_wait_budget
+        assert settings.claim_ttl_seconds + 2 * settings.claim_poll_seconds < (
+            settings.retry_wait_budget
+        )
+
+    def test_ttl_below_gateway_time_is_rejected(self) -> None:
+        # короче шлюза: второй consumer перехватил бы клейм у работающего первого
+        with pytest.raises(ValueError, match="must be at least"):
+            make_settings(claim_ttl_seconds=3, process_max_seconds=5.0)
+
+    def test_ttl_must_cover_gateway_plus_finalize_margin(self) -> None:
+        # 5с шлюза + 5с запаса на финализацию = 10с минимум
+        with pytest.raises(ValueError, match="at least"):
+            make_settings(claim_ttl_seconds=8, process_max_seconds=5.0)
+
+    def test_ttl_needs_strict_margin_below_budget(self) -> None:
+        # budget = 48 при дефолтах: 47 + 2*0.5 = 48 -> запаса нет, отклоняем
+        with pytest.raises(ValueError, match="duplicate-wait budget"):
+            make_settings(claim_ttl_seconds=47)
 
     def test_budget_counts_waits_and_retry_ttls(self) -> None:
         settings = make_settings(
@@ -35,6 +52,13 @@ class TestClaimBudget:
         settings = make_settings(claim_ttl_seconds=30, claim_wait_seconds=15)
 
         assert settings.claim_ttl_seconds < settings.retry_wait_budget
+
+    def test_ttl_just_below_the_strict_limit_is_accepted(self) -> None:
+        settings = make_settings(claim_ttl_seconds=46, claim_wait_seconds=15)
+
+        assert settings.claim_ttl_seconds + 2 * settings.claim_poll_seconds < (
+            settings.retry_wait_budget
+        )
 
     def test_bigger_wait_allows_bigger_ttl(self) -> None:
         settings = make_settings(claim_ttl_seconds=60, claim_wait_seconds=25)
