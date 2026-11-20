@@ -326,7 +326,7 @@ curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
 |---|---|---|
 | Три неудачных webhook → DLQ | см. блок ниже: нужны `PAYMENT_RUN_DLQ_E2E=1` и адрес management API (в CI — отдельный шаг job'а **E2E**) | ровно 3 HTTP-попытки с одинаковым `event_id`, событие в `payments.dlq` |
 | SIGKILL consumer'а посреди обработки | `./scripts/chaos_kill9.sh` | клейм остаётся после `docker kill --signal=KILL`, дубликат дожидается TTL, перехватывает клейм и доводит платёж до финала; клейм снят, новых записей в `payments.dlq` нет |
-| Полный поток API → outbox → consumer → webhook | `pytest tests/e2e` | 202, идемпотентный повтор, 409, смена статуса, HMAC-подпись от сырых байтов, отсутствие `metadata`/`webhook_url` в теле |
+| Полный поток API → outbox → consumer → webhook | `pytest tests/e2e` | 202 + `Location`, идемпотентный повтор, 409, смена статуса, HMAC-подпись от сырых байтов, отсутствие `metadata`/`webhook_url` в теле, изоляция от чужих уведомлений на общем порту |
 | Outbox, UoW, клеймы на реальном PostgreSQL | `pytest tests/integration` | атомарность платежа и outbox, claim/finalize/release, истечение клейма, `fetch_unsent` |
 | Инварианты конфигурации и топологии | `pytest tests/unit` | бюджеты клеймов, TTL retry-очередей, prefetch, маршрутизация outbox, fencing, паритет ORM-`metadata` с миграциями |
 

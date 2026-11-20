@@ -26,7 +26,12 @@ WEBHOOK_PORT = int(os.environ.get("PAYMENT_E2E_WEBHOOK_PORT", "9000"))
 
 
 class WebhookCollector:
-    """Минимальный HTTP-сервер: собирает сырые байты тела и заголовок подписи."""
+    """Минимальный HTTP-сервер: собирает сырые байты тела и заголовок подписи.
+
+    Порт 9000 общий для всех webhook-сценариев стенда (в него же попадают
+    ретраи уведомлений других прогонов), поэтому забирать сообщения нужно по
+    id своего платежа, а не по порядку прихода.
+    """
 
     def __init__(self) -> None:
         self.received: list[tuple[str | None, bytes]] = []
@@ -50,12 +55,36 @@ class WebhookCollector:
 
     def stop(self) -> None:
         self.httpd.shutdown()
+        self.httpd.server_close()
 
     @staticmethod
     def docker_host_url() -> str:
         # consumer работает внутри контейнера: адрес хоста — host.docker.internal
         host = os.environ.get("PAYMENT_WEBHOOK_PUBLIC_HOST", "host.docker.internal")
         return f"http://{host}:{WEBHOOK_PORT}/webhook"
+
+    @staticmethod
+    def local_url() -> str:
+        """Адрес коллектора для запросов из самого теста (без docker DNS)."""
+        return f"http://127.0.0.1:{WEBHOOK_PORT}/webhook"
+
+    def wait_for(self, payment_id: str, timeout: float = 15.0) -> tuple[str | None, bytes]:
+        """Ждёт уведомление конкретного платежа, игнорируя чужие."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for signature, raw_body in list(self.received):
+                try:
+                    payload = json.loads(raw_body)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("id") == payment_id:
+                    return signature, raw_body
+            time.sleep(0.2)
+        seen = [json.loads(body).get("id") for _, body in list(self.received) if body]
+        pytest.fail(
+            f"webhook для платежа {payment_id} не дошёл за {timeout:.0f}с "
+            f"(получено уведомлений: {len(self.received)}, id: {seen})"
+        )
 
 
 def headers(idempotency_key: str) -> dict:
@@ -101,6 +130,7 @@ class TestFullFlow:
                 payment_id = body["payment_id"]
                 assert body["status"] == "pending"
                 assert "created_at" in body
+                assert r.headers["Location"] == f"/api/v1/payments/{payment_id}"
 
                 # 2. идемпотентный повтор — тот же платёж
                 r2 = client.post(
@@ -125,11 +155,7 @@ class TestFullFlow:
                     assert payment["failure_reason"]
 
                 # 5. webhook дошёл и подпись валидна для СЫРЫХ байтов тела
-                deadline = time.monotonic() + 15.0
-                while time.monotonic() < deadline and not collector.received:
-                    time.sleep(0.3)
-                assert collector.received, "webhook was not delivered"
-                signature, raw_body = collector.received[0]
+                signature, raw_body = collector.wait_for(payment_id, timeout=15.0)
                 assert signature is not None
                 assert verify_body(WEBHOOK_SECRET, raw_body, signature), (
                     "signature does not match the delivered body"
@@ -140,6 +166,42 @@ class TestFullFlow:
                 # приватные данные не утекают в webhook
                 assert "webhook_url" not in webhook_payload
                 assert "metadata" not in webhook_payload
+        finally:
+            collector.stop()
+
+    def test_foreign_webhook_on_shared_port_does_not_break_the_scenario(self) -> None:
+        """Ретрай чужого уведомления на том же порту не должен подменять проверку."""
+        collector = WebhookCollector()
+        collector.start()
+        key = f"e2e-foreign-{uuid.uuid4()}"
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                foreign_id = str(uuid.uuid4())
+                foreign = client.post(
+                    collector.local_url(),
+                    json={"id": foreign_id, "event": "payment.succeeded", "event_id": "foreign"},
+                )
+                assert foreign.status_code == 200
+
+                payload_json = {
+                    "amount": "5.55",
+                    "currency": "EUR",
+                    "description": "E2E payment with a foreign webhook",
+                    "metadata": {},
+                    "webhook_url": collector.docker_host_url(),
+                }
+                created = client.post(
+                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
+                )
+                assert created.status_code == 202, created.text
+                payment_id = created.json()["payment_id"]
+                wait_for_final_status(client, payment_id)
+
+                signature, raw_body = collector.wait_for(payment_id, timeout=20.0)
+                delivered = json.loads(raw_body)
+
+                assert delivered["id"] == payment_id != foreign_id
+                assert verify_body(WEBHOOK_SECRET, raw_body, signature)
         finally:
             collector.stop()
 
