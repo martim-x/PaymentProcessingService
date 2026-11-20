@@ -79,9 +79,16 @@ PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true docker compose up --build
 их использовать нельзя.
 
 Поднимаются сервисы: `postgres` (5433 → 5432), `rabbitmq` (5673, UI 15673, данные в
-volume `rabbitmqdata`), одноразовый `migrate` (`alembic upgrade head`), `api`, `relay` и
+volume `rabbitmqdata44`), одноразовый `migrate` (`alembic upgrade head`), `api`, `relay` и
 один `consumer`. Миграции применяются автоматически, остальные сервисы ждут их
 завершения.
+
+Используются PostgreSQL 19.0 и RabbitMQ 4.4.1. Для них выделены новые volumes
+`pgdata19` и `rabbitmqdata44`; прежние `payment-service_pgdata` (PG16) и
+`payment-service_rabbitmqdata` не подключаются и не изменяются. Данные автоматически
+между major-версиями не мигрируют: для сохранения БД требуется отдельная проверенная
+миграция/backup-restore, RabbitMQ также требует отдельной процедуры совместимого
+обновления. Не удаляйте старые volumes, пока данные не перенесены и не проверены.
 
 - API: http://localhost:8000. Swagger UI, ReDoc и публичный `/openapi.json` отключены — ТЗ требует `X-API-Key` на всех эндпоинтах. Схема доступна под ключом на `/api/v1/openapi.json`, порядок работы — в разделе «Документация API». `/health` тоже требует ключ.
 - RabbitMQ UI: http://localhost:15673 (guest/guest)
@@ -214,25 +221,29 @@ curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
     where event_id = '<event_id>';
    ```
 
-3. Достать сообщение из DLQ и опубликовать его в рабочую очередь. В UI
-   (`http://localhost:15673`, `payments.dlq`) это «Get messages» с `Ack Mode =
-   ack_requeue_false` и повторная публикация того же payload в `payments.new`; из
-   терминала — двумя запросами к Management API:
+3. **Не используйте `ack_requeue_false` для redrive.** Этот режим уничтожает
+   сообщение из DLQ до того, как отдельная публикация завершится; если publish
+   не удался, исходник уже потерян. Management API `get` не предоставляет
+   атомарного transfer DLQ → рабочая очередь. Для ручного redrive с сохранением
+   исходника используйте RabbitMQ UI «Get messages» с `Ack Mode = reject_requeue_true`
+   (оставить/вернуть исходник в DLQ), затем скопируйте полный payload и свойства
+   сообщения и опубликуйте копию в `payments.new`. В Management API при публикации
+   считайте операцию
+   успешной только при `routed: true`; HTTP 200 без `routed: true` не подтверждает,
+   что сообщение дошло до очереди. Пример для публикации (подставьте полный payload,
+   корректно JSON-экранированный):
 
-   ```bash
-   # забрать сообщение из DLQ (Management API на порту управления RabbitMQ)
-   curl -s -u guest:guest -X POST http://localhost:15673/api/queues/%2F/payments.dlq/get \
-     -H 'content-type: application/json' \
-     -d '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto","truncate":50000}'
-
-   # вернуть его в рабочую очередь
-   curl -s -u guest:guest -X POST http://localhost:15673/api/exchanges/%2F/amq.default/publish \
-     -H 'content-type: application/json' \
-     -d '{"properties":{},"routing_key":"payments.new","payload":"{\"event\":\"payment.created\",\"payment_id\":\"<payment_id>\"}","payload_encoding":"string"}'
+   ```json
+   {"properties":{"delivery_mode":2},"routing_key":"payments.new","payload":"<полный исходный payload>","payload_encoding":"string"}
    ```
 
-4. Проверить результат: `webhook_deliveries.attempts` снова растёт, `status`
-   становится `delivered`, новых сообщений в `payments.dlq` нет.
+   Исходник оставьте в DLQ до проверки результата: обычный `get` забирает сообщение
+   с начала очереди и не умеет безопасно выбрать нужное по `payment_id`. Удаление
+   отдельных сообщений из общей DLQ этой инструкцией не автоматизировано; для него
+   нужен отдельный consumer с ручным ACK и выбором нужного сообщения. Между публикацией
+   копии и удалением исходника нет общей транзакции, поэтому возможны дубликаты.
+   Сохраняйте исходный payload и свойства, если они есть; получатель webhook должен
+   дедуплицировать уведомления по стабильному `event_id`. Проверьте статус доставки.
 
 ## Надёжность
 
@@ -387,11 +398,13 @@ compose up`: каждый `up`/`start` пересоздаёт consumer и под
 
 ## Разработка
 
-Проект требует Python ≥ 3.12; в CI прогоняются 3.12 и 3.13.
+Проект требует Python ≥ 3.15.2; в CI используется Python 3.15.2.
 
 ```bash
-python3.13 -m venv venv
-venv/bin/pip install -e ".[test]" ruff mypy bandit pre-commit
+python3.15 -m venv venv
+venv/bin/pip install --require-hashes -r requirements.lock
+venv/bin/pip install --no-deps -e .
+venv/bin/pip install ruff==0.17.5 mypy==2.4.1 'bandit[toml]==1.9.4' pre-commit
 ```
 
 ### Гейты качества (те же, что в CI)
@@ -413,8 +426,11 @@ pre-commit install   # ruff + ruff-format, bandit, mypy, unit-тесты и ба
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) — 6 job'ов:
-**ruff → mypy → bandit → unit (3.12 и 3.13) → integration (PG-сервис) → e2e
-(docker compose + chaos-скрипт + DLQ E2E)**.
+**ruff → mypy → bandit → unit (3.15.2) → integration (PG-сервис) → e2e
+(docker compose + chaos-скрипт + DLQ E2E)**. Runtime и test-зависимости закреплены
+в `pyproject.toml`, полный hash-lock для Python 3.15 лежит в `requirements.lock`;
+Docker и CI устанавливают зависимости из него; версии самих инструментов качества
+зафиксированы в workflow, их транзитивные зависимости — нет.
 
 ### Время жизни зависимостей и prefetch
 

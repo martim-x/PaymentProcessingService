@@ -13,8 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install ruff
+          python-version: "3.15.2"
+      - run: pip install ruff==0.17.5
       - run: ruff check src tests
       - run: ruff format --check src tests
 
@@ -25,10 +25,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.15.2"
       - name: Установка зависимостей
-        run: pip install -e ".[test]"
-      - run: pip install mypy
+        run: pip install --require-hashes -r requirements.lock && pip install --no-deps -e .
+      - run: pip install mypy==2.4.1
       - run: mypy src/payment
 
   bandit:
@@ -38,8 +38,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install "bandit[toml]"
+          python-version: "3.15.2"
+      - run: pip install "bandit[toml]==1.9.4"
       - name: Сканирование src
         # -r обязателен: без него bandit пишет "Skipping directory (src)" и выходит с кодом 0
         run: bandit -c pyproject.toml -r -q src
@@ -49,13 +49,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.12", "3.13"]
+        python: ["3.15.2"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[test]"
+      - run: pip install --require-hashes -r requirements.lock && pip install --no-deps -e .
       - run: pytest tests/unit -q
 
   integration:
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:19.0-alpine
         env:
           POSTGRES_USER: payment
           POSTGRES_PASSWORD: payment
@@ -79,8 +79,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install -e ".[test]"
+          python-version: "3.15.2"
+      - run: pip install --require-hashes -r requirements.lock && pip install --no-deps -e .
       - name: Миграции
         env:
           PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@localhost:5432/payments
@@ -105,9 +105,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.15.2"
       - name: Установка зависимостей
-        run: pip install -e ".[test]"
+        run: pip install --require-hashes -r requirements.lock && pip install --no-deps -e .
       - name: Поднять стек
         run: docker compose up --build -d
       - name: Дождаться готовности API
