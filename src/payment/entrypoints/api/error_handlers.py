@@ -1,6 +1,12 @@
 """Маппинг доменных и application-исключений в HTTP-коды."""
 
+import math
+from decimal import Decimal
+from typing import Any
+
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from payment.application.exceptions import ApplicationError, IdempotencyConflict, PaymentNotFound
@@ -12,7 +18,33 @@ from payment.domain.exceptions import (
 )
 
 
+def _json_safe(value: Any) -> Any:
+    """Заменяет non-finite числа строками до JSON-сериализации.
+
+    Pydantic кладёт исходный ввод в detail ошибки: Decimal('NaN')/float('nan')
+    не кодируются json.dumps, и клиент вместо 422 получал бы 500.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, Decimal) and not value.is_finite():
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": jsonable_encoder(_json_safe(exc.errors()))},
+        )
+
     @app.exception_handler(PaymentNotFound)
     async def _payment_not_found(request: Request, exc: PaymentNotFound) -> JSONResponse:
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": str(exc)})

@@ -66,6 +66,69 @@ class TestClaimBudget:
         assert settings.claim_ttl_seconds <= settings.retry_wait_budget
 
 
+class TestNumericLimits:
+    """Конфиг не должен пропускать значения, ломающие TTL-цепочки и клеймы.
+
+    Ноль в `retry_base_delay` даёт TTL 0 — retry-очередь возвращает сообщение
+    мгновенно, то есть горячий цикл; `claim_poll_seconds=0` — busy-loop опроса
+    клейма; `consumer_prefetch=0` в aio-pika означает «без ограничения».
+    """
+
+    @pytest.mark.parametrize("delay", [0, -1.0])
+    def test_non_positive_retry_base_delay_is_rejected(self, delay: float) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_RETRY_BASE_DELAY"):
+            make_settings(retry_base_delay=delay)
+
+    @pytest.mark.parametrize("factor", [0, -2.0, 0.5])
+    def test_retry_factor_below_one_is_rejected(self, factor: float) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_RETRY_FACTOR"):
+            make_settings(retry_factor=factor)
+
+    @pytest.mark.parametrize("attempts", [0, -1, 1])
+    def test_max_attempts_below_two_is_rejected(self, attempts: int) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_MAX_ATTEMPTS"):
+            make_settings(max_attempts=attempts)
+
+    @pytest.mark.parametrize("prefetch", [0, -5])
+    def test_non_positive_prefetch_is_rejected(self, prefetch: int) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_CONSUMER_PREFETCH"):
+            make_settings(consumer_prefetch=prefetch)
+
+    @pytest.mark.parametrize("poll", [0, -0.5])
+    def test_non_positive_claim_poll_is_rejected(self, poll: float) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_CLAIM_POLL_SECONDS"):
+            make_settings(claim_poll_seconds=poll)
+
+    @pytest.mark.parametrize("wait", [0, -1.0])
+    def test_non_positive_claim_wait_is_rejected(self, wait: float) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_CLAIM_WAIT_SECONDS"):
+            make_settings(claim_wait_seconds=wait)
+
+    @pytest.mark.parametrize("delay", [0, -3.0])
+    def test_non_positive_infra_retry_delay_is_rejected(self, delay: float) -> None:
+        with pytest.raises(ValueError, match="PAYMENT_INFRA_RETRY_BASE_DELAY"):
+            make_settings(infra_retry_base_delay=delay)
+
+    def test_defaults_are_accepted(self) -> None:
+        settings = make_settings()
+
+        assert settings.max_attempts >= 2
+        assert settings.consumer_prefetch >= 1
+        assert settings.claim_poll_seconds > 0
+        assert settings.claim_wait_seconds > 0
+        assert settings.infra_retry_base_delay > 0
+
+    def test_infra_retry_policy_shares_the_attempt_budget(self) -> None:
+        settings = make_settings(max_attempts=4, infra_retry_base_delay=3.0, retry_factor=2.5)
+
+        policy = settings.infra_retry_policy
+
+        assert policy.max_attempts == 4
+        assert policy.base_delay == 3.0
+        assert policy.factor == 2.5
+        assert policy.delay_for_attempt(2) == pytest.approx(7.5)
+
+
 class TestSecrets:
     def test_empty_key_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="PAYMENT_API_KEY"):

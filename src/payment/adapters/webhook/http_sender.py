@@ -10,7 +10,7 @@ from payment.application.ports.webhook_sender import WebhookSender
 class HttpxWebhookSender(WebhookSender):
     """Сериализует, подписывает и отправляет ОДНИ И ТЕ ЖЕ байты.
 
-    Подпись считается здесь же (а не в composition root и не в use case):
+    Подпись считается здесь же (а не в composition root и не в сервисе сценария):
     сериализация и HMAC обязаны быть в одном месте, иначе они разъедутся.
     """
 

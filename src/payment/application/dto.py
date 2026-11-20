@@ -12,6 +12,14 @@ from payment.domain.model.value_objects import IdempotencyKey
 
 
 @dataclass(frozen=True, slots=True)
+class WebhookDeliveryCommand:
+    event_id: str
+    payment_id: UUID
+    url: str
+    body: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class CreatePaymentCommand:
     amount: Decimal
     currency: Currency
@@ -32,6 +40,7 @@ class ProcessPaymentResult:
     payment_id: UUID
     status: str
     failure_reason: Optional[str] = None
+    webhook_delivery: WebhookDeliveryCommand | None = None
 
 
 @dataclass(frozen=True, slots=True)

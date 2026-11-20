@@ -1,34 +1,88 @@
 # Payment Processing Service
 
-Асинхронный микросервис процессинга платежей (тестовое задание).
+Асинхронный микросервис приёма и обработки платежей. FastAPI принимает запрос; PostgreSQL в одной транзакции сохраняет платёж и событие outbox; relay публикует событие в RabbitMQ; единственный consumer подписан на `payments.new` и в одном обработчике эмулирует платёжный шлюз, фиксирует финальный статус и доставляет клиенту подписанное уведомление до ACK.
 
-FastAPI принимает платёж → outbox → relay публикует в RabbitMQ (`payments.new`) →
-consumer эмулирует шлюз (2–5 сек, 90/10), обновляет статус в PostgreSQL и
-отправляет webhook клиенту с подписью HMAC.
+> Тестовый проект: шлюз эмулируется, реальные денежные операции не выполняются.
 
-Полное описание слоёв и сущностей — [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-Схема архитектуры хранится локально (`docs/architecture.excalidraw`) и в репозиторий не входит.
+## Цель и требования
+
+Цель — показать типовой асинхронный процессинг: быстро принять запрос, надёжно передать работу фоновому обработчику, сохранить результат и уведомить вызывающую сторону.
+
+| Пункт задания | Где реализовано |
+|---|---|
+| Модели и миграции `payments` + `outbox` | `src/payment/adapters/persistence/orm.py`, `migrations/versions/` |
+| API: создание/чтение, `X-API-Key`, `Idempotency-Key` | `src/payment/entrypoints/api/` |
+| Эмуляция шлюза 2–5 с, 90/10 | `src/payment/adapters/gateway/fake_gateway.py` |
+| Consumer: один обработчик очереди `payments.new`, последовательно выполняющий обработку платежа и webhook | `entrypoints/consumer/app.py`, `application/services/payment_service.py`, `application/services/webhook_service.py` |
+| Outbox pattern | `application/services/payment_service.py`, `application/services/outbox_service.py`, `entrypoints/relay/runner.py` |
+| TTL-retry и DLQ | `adapters/messaging/topology.py` (общий бюджет отказов, две лестницы задержек), `routing.py` |
+| DLQ | `payments.dlq` (consumer-процесс) |
+| docker-compose | `docker-compose.yml` |
+| README + примеры | этот файл, [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+
+Runtime запускает consumer-процесс с единственной активной подпиской `payments.new`: один обработчик вызывает `PaymentService`, затем `WebhookService.deliver`, и только после обоих шагов подтверждает сообщение. Отдельного webhook-конвейера нет — ни очереди, ни второго consumer'а.
+
+## Архитектура и паттерны
+
+Код организован вокруг доменной модели платежа и сценариев приложения, с явными портами и адаптерами. Это DDD-вдохновлённая доменная архитектура с элементами Ports & Adapters — не заявление о полном DDD или строгом следовании всем вариантам Onion Architecture.
+
+- **Domain** (`src/payment/domain/`): `Payment` — сущность и корень агрегата, управляющий переходами `pending → succeeded/failed`. `Money`, `PaymentId`, `IdempotencyKey`, `WebhookUrl` — Value Objects. `PaymentCreated`, `PaymentSucceeded`, `PaymentFailed` — доменные события. `ExponentialBackoffRetryPolicy` — Policy.
+- **Application** (`src/payment/application/`): сервисы сценариев (`services/`) координируют шаги через UoW и порты; порты задают контракты репозиториев, Unit of Work, шлюза, webhook sender и publisher.
+- **Adapters** (`src/payment/adapters/`): реализации портов для SQLAlchemy/PostgreSQL, FastStream/RabbitMQ, fake gateway и HTTP webhook.
+- **Entrypoints** (`src/payment/entrypoints/`): FastAPI, единый consumer платежа и webhook, relay (публикация outbox).
+- **Composition root** (`src/payment/bootstrap.py`): собирает адаптеры и фабрики сервисов. Домен не зависит от FastAPI, SQLAlchemy или FastStream.
+
+Доменное событие описывает факт бизнес-модели; сообщение RabbitMQ — транспортный способ доставки, не то же самое.
+
+```text
+Entrypoints (API / Consumer / Relay)
+                 ↓
+        Application (Services)
+           ↓             ↑
+        Domain       Ports (контракты)
+                          ↑
+        Adapters: PostgreSQL / RabbitMQ / HTTP
+```
+
+Это DDD-вдохновлённая доменная организация с Ports & Adapters, а не утверждение о полном внедрении DDD или строгой Onion Architecture. Детальная карта файлов, потоков и решений — [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Технические решения
+
+- **Transactional Outbox + Unit of Work.** Платёж и событие outbox записываются одной транзакцией PostgreSQL. Финальный статус и событие `payment.webhook` — тоже одна транзакция: если вставка в outbox падает, статус откатывается. Relay поллит таблицу (`FOR UPDATE SKIP LOCKED`), маршрутизирует запись по `event_type` и публикует с `persist`, `mandatory` и publisher confirms. Запись `payment.webhook` (payload для возобновления доставки) сохраняется с `dispatch='local'`: relay её не читает, а `sent` остаётся честным флагом публикации и не выставляется заранее. Фактический статус доставки ведётся в `webhook_deliveries`.
+- **Идемпотентность API.** Уникальный `idempotency_key` и SHA-256 fingerprint канонического тела (сумма нормализуется: `100.5 ≡ 100.50`). Тот же запрос возвращает существующий платёж; тот же ключ с другим телом — `409 Conflict`. Гонку двух одновременных POST разрешает unique-индекс: проигравший ловит `IntegrityError` и перечитывает платёж победителя.
+- **Клейм обработки платежа.** Атомарный `UPDATE ... SET locked_until = now() + ttl WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())` не допускает конкурентную обработку. Шлюз и финализация идут вне транзакции; финальный статус пишется условным `UPDATE` под токеном клейма. Клейм снимается при любой ошибке и при `SIGTERM`; при `SIGKILL` он истекает по TTL. Дубликат сообщения ждёт освобождения клейма до `PAYMENT_CLAIM_WAIT_SECONDS` и тихо завершается, если платёж уже финальный.
+- **Клейм доставки webhook.** Таблица `webhook_deliveries` хранит состояние доставки по стабильному `event_id`; `locked_until` работает как fencing token — записать итог может только владелец действующего клейма. Устаревший обработчик не перетирает состояние нового.
+- **Retry/DLQ без `sleep`.** Активный обработчик `payments.new` охватывает обработку платежа и доставку webhook; при сбоях повторно маршрутизируется исходное сообщение через TTL-очередь и DLQ. Бюджет отказов общий: `max_attempts` считается по сумме `x-attempt` и `x-infra-attempt`, поэтому третья неудача отправляет сообщение в DLQ независимо от того, чередовались ли бизнес- и инфраструктурные сбои. `WebhookBusy` (клейм занят) откладывается без расхода бюджета. Публикация retry/DLQ подтверждается: если publish упал, исходное сообщение возвращается в очередь (`nack requeue`), а не теряется. Повторное помещение из DLQ — ручная операция: см. раздел «Ручной разбор DLQ».
+- **Инфраструктурные ретраи.** Транзиентный сбой БД/транспорта уходит в отдельную лестницу задержек `payments.new.infra.retry.N` (счётчик `x-infra-attempt`, база `PAYMENT_INFRA_RETRY_BASE_DELAY`): паузы длиннее, чем у обычных ретраев. Бюджет отказов при этом общий — `x-attempt` и `x-infra-attempt` складываются и сравниваются с `PAYMENT_MAX_ATTEMPTS`.
+- **Webhook.** HMAC-SHA256 от `timestamp` и точных байтов тела в `X-Signature` (`t=<unix-ts>,v1=<hex>`); сериализация и подпись живут в одном адаптере, поэтому тело и подпись не могут разъехаться. URL проверяется на SSRF (литеральные приватные IP — ещё на API, `422`).
 
 ## Стек
 
 - **FastAPI** + Pydantic v2, **SQLAlchemy 2.0 async**, **PostgreSQL**
 - **FastStream** (RabbitMQ), **Alembic**, **Docker** + docker-compose
-- Слои: domain → application (use cases + ports) → adapters → entrypoints (DDD)
+- Слои: domain → application (services + ports) → adapters → entrypoints (DDD)
 
 ## Быстрый старт
 
 ```bash
-cp .env.example .env   # замените обязательные API- и webhook-секреты
+cp .env.example .env
+# замените заглушки: PAYMENT_API_KEY и PAYMENT_WEBHOOK_SECRET
 docker compose up --build
 ```
 
-Если `.env` отсутствует, Compose использует `local-dev-key` и `local-webhook-secret`.
-Это только локальные значения для разработки; не используйте их на публичном стенде.
+**Про `.env.example`.** Значения `PAYMENT_API_KEY=change-this-api-key` и
+`PAYMENT_WEBHOOK_SECRET=change-this-webhook-secret` — это placeholders, а не рабочие
+секреты. Приложение отвергает пустые и известные заглушечные значения и **не стартует**,
+пока вы их не замените. Compose без `.env` подставляет свои локальные значения
+(`local-dev-key` / `local-webhook-secret`) — только для локального стенда, на публичном
+их использовать нельзя.
 
-Поднимаются: postgres, rabbitmq (+UI), api, relay (outbox publisher), consumer;
-миграции применяются автоматически.
+Поднимаются сервисы: `postgres` (5433 → 5432), `rabbitmq` (5673, UI 15673, данные в
+volume `rabbitmqdata`), одноразовый `migrate` (`alembic upgrade head`), `api`, `relay` и
+один `consumer`. Миграции применяются автоматически, остальные сервисы ждут их
+завершения.
 
-- API: http://localhost:8000 — Swagger: http://localhost:8000/docs
+- API: http://localhost:8000. Swagger UI, ReDoc и публичный `/openapi.json` отключены — ТЗ требует `X-API-Key` на всех эндпоинтах. Схема доступна под ключом на `/api/v1/openapi.json`, порядок работы — в разделе «Документация API». `/health` тоже требует ключ.
 - RabbitMQ UI: http://localhost:15673 (guest/guest)
 
 ## Примеры
@@ -37,7 +91,7 @@ docker compose up --build
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/payments \
-  -H "X-API-Key: local-dev-key" \
+  -H "X-API-Key: <ваш PAYMENT_API_KEY>" \
   -H "Idempotency-Key: order-42" \
   -H "Content-Type: application/json" \
   -d '{
@@ -49,33 +103,50 @@ curl -X POST http://localhost:8000/api/v1/payments \
       }'
 ```
 
-Ответ — `202 Accepted`:
+Ответ — `202 Accepted`; для нового платежа добавляется заголовок `Location`:
 
 ```json
 {"payment_id": "…", "status": "pending", "created_at": "…"}
 ```
 
-Повтор запроса с тем же `Idempotency-Key` и тем же телом вернёт тот же платёж
-(нового платежа не будет); с другим телом — `409 Conflict`.
+Повтор с тем же `Idempotency-Key` и тем же телом вернёт тот же платёж (нового не будет,
+`Location` не выставляется); с другим телом — `409 Conflict`. Пустой/пробельный или
+длиннее 255 символов `Idempotency-Key` — `422`.
 
 ### Получение платежа
 
 ```bash
-curl http://localhost:8000/api/v1/payments/<payment_id> -H "X-API-Key: local-dev-key"
+curl http://localhost:8000/api/v1/payments/<payment_id> -H "X-API-Key: <ваш PAYMENT_API_KEY>"
 ```
 
 `status` меняется с `pending` на `succeeded`/`failed` после обработки consumer'ом
-(~2–5 сек), затем на `webhook_url` приходит уведомление:
+(~2–5 сек). В ответе есть `webhook_url`, `failure_reason`, `processed_at`.
+
+### Webhook
+
+На `webhook_url` приходит компактное уведомление (ключи отсортированы — так его
+сериализует подписывающий адаптер):
 
 ```json
-{"status": "succeeded", "id": "…", "amount": "100.5000", "currency": "RUB", "…": "…"}
+{
+  "amount": "100.5000",
+  "currency": "RUB",
+  "event": "payment.succeeded",
+  "event_id": "9f2c…",
+  "failure_reason": null,
+  "id": "…",
+  "processed_at": "2026-11-19T09:15:03.123456+00:00",
+  "status": "succeeded"
+}
 ```
 
-Подпись: заголовок `X-Signature: t=<unix-ts>,v1=<hex>` (плюс `X-Timestamp`).
-Сериализацию и HMAC делает сам адаптер `HttpxWebhookSender` — тело и подпись физически
-не могут разъехаться.
-HMAC-SHA256 считается от `f"{timestamp}.".encode() + body`, где `body` — ровно те байты,
-что уходят в сеть (канонический JSON: `sort_keys`, без пробелов).
+`metadata` и собственный `webhook_url` в тело не попадают. `event_id` — идентификатор
+события доставки: он одинаков во всех попытках доставки одного уведомления, по нему
+получатель дедуплицирует повторы.
+
+Подпись: `X-Signature: t=<unix-ts>,v1=<hex>` и `X-Timestamp`. HMAC-SHA256 считается от
+`f"{timestamp}." + body`, где `body` — ровно те байты, что ушли в сеть (канонический
+JSON: `sort_keys`, без пробелов).
 
 Проверка на стороне получателя:
 
@@ -84,6 +155,8 @@ from payment.adapters.webhook.signer import verify_body
 
 ok = verify_body(secret, raw_request_body, request.headers["X-Signature"])
 ```
+
+`verify_body` дополнительно проверяет окно по времени (по умолчанию 300 секунд).
 
 ### Локальный приём webhook
 
@@ -99,78 +172,193 @@ http.server.HTTPServer(('0.0.0.0', 9000), H).serve_forever()
 PY
 ```
 
+## Документация API
+
+Swagger UI, ReDoc и публичный `/openapi.json` отключены: ТЗ требует `X-API-Key` на
+всех эндпоинтах, а FastAPI регистрирует страницы документации без авторизации.
+Схема осталась доступной — но только под тем же ключом:
+
+```bash
+curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
+  http://localhost:8000/api/v1/openapi.json -o openapi.json
+```
+
+Дальше её смотрит любой внешний инструмент: `npx @redocly/cli preview-docs openapi.json`,
+редактор `editor.swagger.io`, Postman или Insomnia. Публичных страниц, отвечающих без
+ключа, в приложении нет: `/docs`, `/redoc` и `/openapi.json` отдают `404`.
+
+## Ручной разбор DLQ
+
+В `payments.dlq` лежит конверт `payment.created` с `payment_id`; тело HTTP-уведомления
+хранится в БД. Просто вернуть сообщение в очередь недостаточно: запись
+`webhook_deliveries` может остаться в `failed`, и consumer снова завершит сообщение
+через DLQ, не отправив ни одного запроса.
+
+1. Найти платёж и состояние доставки:
+
+   ```bash
+   docker compose exec postgres psql -U payment -d payments -c \
+     "select event_id, payment_id, status, attempts, last_error
+        from webhook_deliveries order by updated_at desc limit 5;"
+   ```
+
+2. Сбросить бюджет доставки (только после того, как причина неудачи устранена):
+
+   ```sql
+   update webhook_deliveries
+      set status = 'pending', attempts = 0, last_error = null, locked_until = null
+    where event_id = '<event_id>';
+   ```
+
+3. Достать сообщение из DLQ и опубликовать его в рабочую очередь. В UI
+   (`http://localhost:15673`, `payments.dlq`) это «Get messages» с `Ack Mode =
+   ack_requeue_false` и повторная публикация того же payload в `payments.new`; из CLI —
+   одной парой команд:
+
+   ```bash
+   docker compose exec rabbitmq rabbitmqadmin get queue=payments.dlq ackmode=ack_requeue_false count=1
+   docker compose exec rabbitmq -it rabbitmqadmin publish exchange=amq.default \
+     routing_key=payments.new payload='{"event":"payment.created","payment_id":"<payment_id>"}'
+   ```
+
+4. Проверить результат: `webhook_deliveries.attempts` снова растёт, `status`
+   становится `delivered`, новых сообщений в `payments.dlq` нет.
+
 ## Надёжность
 
 | Механизм | Реализация |
 |---|---|
-| **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж; `relay` (поллинг `outbox WHERE sent=false`, `FOR UPDATE SKIP LOCKED`) публикует в `payments.new` и помечает sent |
-| **Идемпотентность** | Уникальный `idempotency_key` + fingerprint тела (sha256 канонического JSON, каноническая сумма: `100.5 ≡ 100.50`). Fingerprint считается в use case, а не в HTTP-слое; `IntegrityError` ловится в репозитории и превращается в `IdempotencyViolation`. Повтор → тот же платёж, конфликт → 409 |
-| **Retry** | Ошибки consumer'а (БД и т.п.) → очередь `payments.new.retry.N` с TTL `base·factor^(N-1)` и dead-letter назад в `payments.new`; N≤3. Счётчик попыток едет в заголовке `x-attempt` (x-death теряется при перепубликации) |
-| **Клейм обработки** | Перед вызовом шлюза: `UPDATE ... SET locked_until = now() + PAYMENT_CLAIM_TTL_SECONDS WHERE status='pending' AND (locked_until IS NULL OR locked_until < now())`. Клейм не даёт двум consumer'ам одновременно обрабатывать платёж, пока он действителен. Защита от повторного списания после истечения клейма/сбоя зависит от поддержки и соблюдения `idempotency_key` внешним шлюзом; fake gateway не моделирует реальные списания. При любом сбое после клейма он **снимается** (`release_claim` по токену). Если клейм занят, а платёж ещё `pending` — бросается `PaymentBusy`, сообщение идёт по retry/DLQ (не ack'ается молча). В шлюз передаётся ключ платежа |
-| **Клейм и тайминги** | `PAYMENT_CLAIM_TTL_SECONDS` (30 с) покрывает эмулируемый шлюз (`PAYMENT_PROCESS_MAX_SECONDS`) + финализацию. При реальном шлюзе защита от повторного списания при превышении TTL должна обеспечиваться самим провайдером по `idempotency_key`; fake gateway не моделирует это поведение. Дубликат сообщения ждёт освобождения клейма до `PAYMENT_CLAIM_WAIT_SECONDS` (15 с) и, если платёж стал финальным, тихо завершается — без retry-шума и DLQ |
-| **Согласованность клейма и ретраев** | Настройки проверяются на старте: `claim_ttl_seconds ≤ retry_wait_budget`, где бюджет = `max_attempts × claim_wait_seconds + TTL retry-очередей`. Иначе при `kill -9` consumer'а (клейм не снимается) все попытки истекут раньше, чем клейм протухнет, и сообщение уйдёт в DLQ с платежом в `pending`. Проверяется и нижняя граница: `claim_ttl_seconds ≥ PAYMENT_PROCESS_MAX_SECONDS + PAYMENT_CLAIM_FINALIZE_MARGIN_SECONDS` (иначе клейм короче шлюза), и строгий запас: `TTL + 2 × PAYMENT_CLAIM_POLL_SECONDS < бюджет`. С дефолтами TTL 30 с, бюджет 48 с — дубликат перехватывает клейм и доводит платёж до финала |
-| **Недоступность брокера** | `PublisherUnavailable` (соединение/канал) **не считается попыткой записи**: батч прерывается, уже опубликованное коммитится, `attempts` не растёт. Иначе рестарт RabbitMQ на 10 секунд «сжёг» бы лимит и все записи ушли бы в `failed` |
-| **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у записи растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не мешает остальным |
-| **DLQ** | После 3 попыток сообщение уходит в `payments.dlq` (и из main по `x-dead-letter`) |
-| **Webhook retry** | Попытки с экспоненциальной задержкой (`ExponentialBackoffRetryPolicy`), статус платежа уже закоммичен и от webhook не зависит |
+| **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж (или финальный статус). Relay (поллинг `sent=false AND failed=false AND dispatch='relay'`, `FOR UPDATE SKIP LOCKED`) публикует и помечает `sent`. Записи маршрутизируются по `event_type`; `message_id` — `event_id` из payload, иначе id записи outbox |
+| **Идемпотентность API** | Уникальный `idempotency_key` + fingerprint канонического тела. `IntegrityError` ловится в репозитории и превращается в `IdempotencyViolation`; повтор → тот же платёж, конфликт → `409` |
+| **Retry обработки платежа** | Ошибка обработки → TTL-очередь `payments.new.retry.N`; транзиентный сбой инфраструктуры → `payments.new.infra.retry.N` с более длинными паузами. `x-attempt` и `x-infra-attempt` складываются в общий бюджет: третья неудача любого типа отправляет сообщение в `payments.dlq`. `PaymentBusy`/`WebhookBusy` бюджет не расходуют |
+| **Webhook/outbox** | При финализации сохраняется payload `payment.webhook` с `dispatch='local'`: relay такие строки не выбирает, `sent` не выставляется. Активный обработчик `payments.new` вызывает доставку, её статус хранится в `webhook_deliveries`, а сохранённый payload позволяет возобновить доставку после падения процесса |
+| **DLQ** | `payments.dlq`, durable, разбирается вручную — процедура в разделе «Ручной разбор DLQ» |
+| **Retry webhook** | Ошибка доставки обрабатывается в рамках сообщения `payments.new`: повтор идёт через retry/DLQ того же конвейера, а состояние фактической доставки и число HTTP-неудач ведёт `webhook_deliveries` |
+| **Клейм платежа** | `PAYMENT_CLAIM_TTL_SECONDS` (30 с) покрывает шлюз (`PAYMENT_PROCESS_MAX_SECONDS`) + финализацию. При ошибке/`SIGTERM` клейм снимается по токену (`asyncio.shield`); при `SIGKILL` истекает по TTL. Дубликат ждёт до `PAYMENT_CLAIM_WAIT_SECONDS` (15 с) |
+| **Согласованность таймингов** | На старте проверяется `claim_ttl ≥ process_max + margin`, `claim_ttl + 2·poll < retry_wait_budget` (с дефолтами 30 с < 48 с), `webhook_claim_ttl ≥ webhook_timeout + margin` |
+| **Недоступность брокера** | `PublisherUnavailable` (соединение/канал/нет confirms) **не считается попыткой записи**: батч прерывается, уже опубликованное коммитится, `attempts` не растёт. Иначе рестарт RabbitMQ «сжёг» бы лимит и записи ушли бы в `failed` |
+| **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у неё растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не блокирует остальные |
+| **Poison-сообщение** | Невалидный JSON или `payment_id` сразу уходит в DLQ соответствующего конвейера, без бесконечного ретрая |
+| **Доставка webhook** | Выполняется `WebhookService.deliver` внутри единственного обработчика `payments.new` до ACK; факт доставки и состояние попыток хранит `webhook_deliveries` |
+
+## Семантика доставки: at-least-once
+
+Система не обещает exactly-once — ни для очередей, ни для webhook. Гарантия —
+**at-least-once**, а повторные побочные эффекты отсекаются ключами идемпотентности:
+
+- API — `Idempotency-Key` + fingerprint тела;
+- шлюз — id платежа передаётся как `idempotency_key` (fake gateway ничего не списывает;
+  реальный провайдер должен сам поддержать ключ);
+- брокер — клейм платежа и клейм доставки с fencing token;
+- получатель webhook — `event_id`.
+
+Повторное уведомление возможно, если процесс упал между успешным HTTP-запросом и
+записью `delivered` (в том числе `SIGKILL`), если клейм истёк во время отправки и
+событие подхватил другой consumer, либо при ручной переигровке сообщения из DLQ.
+`event_id` при этом не меняется, поэтому повтор распознаётся получателем.
+
+## Соответствие буквальному ТЗ
+
+| Требование | Что сделано | Примечание |
+|---|---|---|
+| Один consumer обрабатывает платёж и webhook | `consumer/app.py` регистрирует единственную подписку на `payments.new`; один handler вызывает `PaymentService`, затем `WebhookService.deliver` до ACK | Второго конвейера нет; статус HTTP-доставки в `webhook_deliveries` |
+| Outbox | Платёж и `payment.created` сохраняются транзакционно; outbox публикует relay | Запись `payment.webhook` хранится с `dispatch='local'` и не публикуется |
+| Retry/DLQ | Предел `PAYMENT_MAX_ATTEMPTS` общий: бюджет = `x-attempt` + `x-infra-attempt`, после третьего отказа — `payments.dlq` | DLQ replay ручной; запись `webhook_deliveries` сама не сбрасывается, поэтому её сбрасывают явно |
+| — | `event_id` генерируется как `uuid4().hex` при финализации платежа | Это стаб: он стабилен для всех попыток доставки одного события, но не выводится из состояния платежа. В реальной системе это был бы id записи outbox или детерминированный бизнес-ключ |
 
 ## Безопасность
 
-- **Секреты обязательны вне локального Compose**: приложение отвергает пустые и известные
-  заглушечные значения `PAYMENT_API_KEY` / `PAYMENT_WEBHOOK_SECRET`. Compose без `.env`
-  подставляет только локальные значения для разработки (см. быстрый старт); их нельзя
-  использовать на публичном стенде.
+- **Секреты обязательны.** Приложение отвергает пустые и известные заглушечные значения
+  `PAYMENT_API_KEY` / `PAYMENT_WEBHOOK_SECRET` и не стартует. `.env.example` — шаблон:
+  placeholders нужно заменить (см. быстрый старт).
 - **Сравнение API-ключа** — `hmac.compare_digest` (константное время).
-- **SSRF-гард**: `webhook_url` проверяется перед отправкой — блокируются loopback,
-  приватные, link-local и зарезервированные адреса (после DNS-резолва).
-  Для локальных стендов есть `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`.
-- **Валидация**: ошибки домена (`InvalidMoney`, `InvalidWebhookUrl`) → `422`, а не `500`;
-  лимиты на `description` (1000) и `metadata` (8 KB), сумма ≤ `Numeric(19,4)`.
-- **Fingerprint** считается от канонической суммы (`100.5` ≡ `100.50`) — без ложных 409.
+- **SSRF-гард.** `webhook_url` проверяется перед отправкой: блокируются loopback,
+  приватные, link-local, зарезервированные адреса и CGNAT — после DNS-резолва.
+  Литеральные приватные IP отсекаются ещё на API (`422`). Для локальных стендов есть
+  `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`; в Compose по умолчанию разрешение выключено.
+- **Валидация входа.** `description` ≤ 1000 символов, `metadata` ≤ 8 KB и только
+  конечные числа/строки без NUL, `webhook_url` ≤ 2048, сумма > 0 и в пределах
+  `Numeric(19,4)`. Доменные ошибки (`InvalidMoney`, `InvalidWebhookUrl`) → `422`, не `500`.
 - **Webhook-payload компактный**: без `metadata` и собственного `webhook_url`.
+- **Подпись** HMAC-SHA256 с timestamp и окном проверки — защита от подмены тела и replay.
+- **Контейнер** работает не от root (uid 10001).
+
+### Ограничения безопасности
+
+Это учебный сервис; перечисленное ниже — осознанные границы, а не забытые баги.
+
+- **Статический API-ключ**: один на весь сервис, без ротации, скоупов, арендаторов и
+  rate limiting. Утечка ключа = полный доступ к API.
+
+- **Нет TLS**: ни HTTP API, ни AMQP, ни webhook-вызовы не терминируют TLS. Рассчитано
+  на reverse-proxy/доверенную сеть; в Compose порты опубликованы на хост.
+- **Один общий webhook-секрет** для всех получателей; нет per-endpoint секретов и
+  ротации. Получатель обязан сам проверять окно timestamp (библиотечный
+  `verify_body` это делает, но только если его вызвать).
+- **SSRF-защита не абсолютна**: проверка идёт отдельным DNS-запросом, поэтому
+  теоретически возможен DNS-rebinding между проверкой и коннектом `httpx`. Для локального
+  E2E private targets разрешайте явно через `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`.
+- **Секреты только в переменных окружения** (`.env`, compose environment): нет vault/KMS,
+  значения видны в `docker inspect`. `.env` в git не попадает, `.env.example` — только
+  шаблон.
+- **Инфраструктура без изоляции**: RabbitMQ `guest/guest` и management UI, PostgreSQL с
+  паролем из compose опубликованы на хост; отдельного сетевого периметра нет.
+- **Данные не шифруются at-rest**: `outbox`, `webhook_deliveries`, `payments` лежат в
+  открытом виде. `metadata` — произвольный JSON, сервис его не чистит и не маскирует.
+- **Нет аудита доступа и антифрода**: нет журнала, кто и когда читал платёж; нет лимитов
+  на количество платежей и на размер тела запроса целиком (ограничены только поля).
+- **DLQ и ручные операции** не аутентифицированы: доступ к RabbitMQ UI = доступ к
+  сообщениям и возможность переигровки.
 
 ## Воспроизводимые проверки
 
 | Сценарий | Как запустить | Что проверяет |
 |---|---|---|
-| SIGKILL consumer'а посреди обработки | `./scripts/chaos_kill9.sh` | клейм остаётся после `docker kill --signal=KILL`, дубликат дожидается протухания TTL, перехватывает клейм и доводит платёж до финала; клейм снят, новых записей в DLQ нет (сравнение с числом до сценария) |
-| Полный поток API → outbox → consumer → webhook | `pytest tests/e2e` | 202, идемпотентный повтор, 409, смена статуса, HMAC-подпись от сырых байтов |
-| Outbox против реального PostgreSQL | `pytest tests/integration` | атомарность UoW, claim/finalize/release, poison-записи |
+| Три неудачных webhook → DLQ | `PAYMENT_RUN_DLQ_E2E=1 pytest tests/e2e/test_failed_webhook_dlq.py` (в CI — отдельный шаг job'а **E2E**) | ровно 3 HTTP-попытки с одинаковым `event_id`, событие в `payments.dlq` |
+| SIGKILL consumer'а посреди обработки | `./scripts/chaos_kill9.sh` | клейм остаётся после `docker kill --signal=KILL`, дубликат дожидается TTL, перехватывает клейм и доводит платёж до финала; клейм снят, новых записей в `payments.dlq` нет |
+| Полный поток API → outbox → consumer → webhook | `pytest tests/e2e` | 202, идемпотентный повтор, 409, смена статуса, HMAC-подпись от сырых байтов, отсутствие `metadata`/`webhook_url` в теле |
+| Outbox, UoW, клеймы на реальном PostgreSQL | `pytest tests/integration` | атомарность платежа и outbox, claim/finalize/release, истечение клейма, `fetch_unsent` |
+| Инварианты конфигурации и топологии | `pytest tests/unit` | бюджеты клеймов, TTL retry-очередей, prefetch, маршрутизация outbox, fencing, паритет ORM-`metadata` с миграциями |
 
 `scripts/chaos_kill9.sh` выполняется и в CI (job **E2E**), поэтому гарантия
-«платёж не застревает после жёсткого падения» подтверждается автоматически, а не словами.
+«платёж не застревает после жёсткого падения» подтверждается автоматически.
 
 ## Ограничения (осознанные)
 
-- **Доставка webhook не идёт через outbox.** Если consumer упадёт между commit'ом статуса
-  и отправкой, уведомление потеряется (статус при этом корректен). Для гарантии нужен
-  отдельный outbox webhook-событий с собственным retry — не реализовано.
-- **Отправленные строки outbox не чистятся**: индекс `ix_outbox_unsent` частичный
-  (`WHERE sent = false`), но сама таблица растёт — нужна периодическая архивация.
-- **SSRF-проверка при отправке идёт отдельным DNS-запросом**, поэтому теоретически
-  возможен DNS-rebinding между проверкой и коннектом httpx (для полной защиты нужен
-  кастомный transport с подключением по проверенному IP). Литеральные приватные IP
-  отсекаются ещё на API (`422`).
-- **Relay читает outbox с `FOR UPDATE SKIP LOCKED`** на время публикации батча —
-  несколько relay'ев безопасны; «ядовитая» запись ограничена `PAYMENT_OUTBOX_MAX_ATTEMPTS`.
-- **`ProcessPayment` — толстый use case**: вызов шлюза, финализация, payload и webhook-ретраи
-  в одном сценарии. Доставка уведомления заслуживает отдельного `NotifyWebhook` со своим
-  outbox — не реализовано (см. пункт про гарантию доставки).
-- **Политика retry/DLQ** вынесена в адаптер `adapters/messaging/routing.py`;
-  entrypoint только вызывает её.
-- **Миграция `0001_initial` правилась на месте** (в неё входят `locked_until`,
-  `failed`, `attempts`). Для уже применённой схемы Alembic её не перенакатит —
-  нужен `docker compose down -v` (чистый стенд) или отдельная ревизия.
-- **Занятый клейм**: дубликат ждёт до `PAYMENT_CLAIM_WAIT_SECONDS`; если клейм так
-  и не освободился (первый consumer завис или шлюз медленнее TTL), сообщение уходит
-  в retry/DLQ — это корректное поведение, DLQ разбирается вручную.
-- **Отмена задачи (SIGTERM)** теперь тоже снимает клейм: `except BaseException`
-  + `asyncio.shield`, поэтому `CancelledError` не оставляет платёж заблокированным.
+- **Отправленные строки outbox и записи `webhook_deliveries` не чистятся.** Индекс
+  `ix_outbox_unsent` частичный (`WHERE sent = false`), но таблицы растут — нужна
+  периодическая архивация.
+- **Relay держит блокировки строк на время публикации батча.** `FOR UPDATE SKIP LOCKED`
+  берётся при выборке, а `commit` — после публикации всего батча, поэтому сетевые
+  вызовы в брокер происходят внутри открытой транзакции. Несколько relay'ев безопасны
+  (пропускают заблокированные строки), но при медленном брокере транзакция и блокировки
+  живут дольше. Вынос публикации за транзакцию потребовал бы отдельного статуса
+  «publishing» и reclaim-логики.
+- **`webhook_deliveries.attempts` и заголовки очереди расходятся.** Заголовки считают отказы обработки сообщения (включая сбои БД), `webhook_deliveries.attempts` — только зафиксированные неудачи HTTP-доставки. Поэтому событие может попасть в DLQ раньше, чем в `webhook_deliveries` накопится три неудачи: это ожидаемо и разбирается вручную.
+- **Ручной DLQ replay требует сброса записи доставки**: возврат сообщения в очередь сам по себе не снимает `failed` в `webhook_deliveries`, и consumer снова завершит сообщение через DLQ, не отправив HTTP-запрос. Пошаговая процедура — в разделе «Ручной разбор DLQ».
+- **`event_id` — стаб** (см. таблицу отступлений): он не выводится из платежа и не
+  гарантирует «одно событие на платёж» на уровне бизнес-ключа.
+- **Повторные уведомления возможны** (at-least-once): получатель обязан дедуплицировать
+  по `event_id`. Гарантии «ровно одно уведомление» нет.
+- **Клейм платежа не защищает от двойного списания при истечении TTL.** Пока клейм
+  жив, второй consumer не начнёт обработку; если реальный шлюз медленнее TTL, защита
+  ложится на `idempotency_key` провайдера. Fake gateway списаний не моделирует.
+- **SSRF-проверка при отправке идёт отдельным DNS-запросом** — окно для DNS-rebinding
+  (для полной защиты нужен transport с подключением по проверенному IP).
+- **Миграция `0001_initial` правилась на месте** (в неё входят `locked_until`, `failed`,
+  `attempts`, `event_type`). Для уже применённой схемы Alembic её не перенакатит:
+  нужен `docker compose down -v` (чистый стенд) или отдельная ревизия. `0002` добавляет
+  `webhook_deliveries` и индекс `ix_outbox_event_type`., `0003` — колонку
+  `outbox.dispatch` и частичный индекс `ix_outbox_relay_pending`.
+- **Зависший клейм**: если платёж так и не освободился (первый consumer завис, шлюз
+  медленнее TTL), сообщение уходит в retry/DLQ — это корректное поведение, DLQ
+  разбирается вручную.
+- **Отмена задачи (SIGTERM)** снимает клеймы платежа и доставки под их токенами
+  (`asyncio.shield`), поэтому `CancelledError` не оставляет запись заблокированной.
 
 ## Разработка
 
-Проект требует Python ≥ 3.12; **локально весь набор тестов и линтеров прогнан на
-Python 3.15.2** (venv проекта), в CI используется 3.13.
+Проект требует Python ≥ 3.12; в CI прогоняются 3.12 и 3.13.
 
 ```bash
 python3.13 -m venv venv
@@ -189,48 +377,58 @@ venv/bin/python -m pytest tests/integration -q           # integration (нуже
 venv/bin/python -m pytest tests/e2e -q                   # e2e (нужен живой compose)
 ```
 
-### Pre-commit
+### Pre-commit и CI
 
 ```bash
-pre-commit install   # ruff, bandit, mypy, unit-тесты на каждый коммит
+pre-commit install   # ruff + ruff-format, bandit, mypy, unit-тесты и базовые проверки файлов
 ```
 
-### CI
-
 GitHub Actions (`.github/workflows/ci.yml`) — 6 job'ов:
-**ruff → mypy → bandit → unit → integration (PG-сервис) → e2e (docker compose)**.
+**ruff → mypy → bandit → unit (3.12 и 3.13) → integration (PG-сервис) → e2e
+(docker compose + chaos-скрипт + DLQ E2E)**.
 
-**Время жизни зависимостей:** use case'ы создаются на каждый запрос
-(`Depends`-фабрика), UoW хранит сессию и защищён от повторного входа —
-иначе параллельные запросы смешали бы транзакции.
+### Время жизни зависимостей и prefetch
 
-Consumer берёт `PAYMENT_CONSUMER_PREFETCH` сообщений одновременно; webhook-ретраи
-выполняются внутри обработчика и занимают слот — при большом потоке поднимайте
-и prefetch, и число consumer-реплик.
+Сервисы создаются на каждый запрос (`Depends`-фабрика), UoW хранит сессию и защищён
+от повторного входа — иначе параллельные запросы смешали бы транзакции.
 
-Интеграционные тесты требуют PostgreSQL:
+Consumer подписан только на `payments.new`. Обработка платежа и HTTP-доставка webhook выполняются последовательно в одном handler, поэтому медленный webhook удерживает сообщение без ACK и занимает слот prefetch. Увеличение prefetch/числа consumer-реплик масштабирует именно этот объединённый путь: выделенного webhook-конвейера и отдельной подписки больше нет.
+
+### Интеграционные тесты
+
+Интеграционные тесты читают DSN **только** из `PAYMENT_TEST_DATABASE_URL`:
 
 ```bash
-PAYMENT_DATABASE_URL=postgresql+psycopg://payment:payment@localhost:5433/payments \
+PAYMENT_TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5433/payments_test \
   venv/bin/python -m pytest tests/integration -q
 ```
 
-E2E-тесты требуют поднятый compose (`docker compose up -d`) и слушают порт 9000
-для приёма webhook; адрес хоста из контейнера — `host.docker.internal`.
-E2E проверяет и саму HMAC-подпись: считает её заново от сырых байтов полученного тела.
+- `PAYMENT_DATABASE_URL` рабочего стека **не используется как fallback** — иначе тесты
+  могли бы писать в рабочую БД.
+- Отдельной переменной «пропустить тесты» нет. Если `PAYMENT_TEST_DATABASE_URL` не
+  задан, набор скипается целиком; чтобы прогнать его, задайте переменную.
+- Нужен DSN именно `postgresql+psycopg://`: изоляция строится на libpq
+  `options=-csearch_path=...`.
+- Каждый тест работает в собственной временной схеме `pytest_<12 hex>`; `TRUNCATE` и
+  `DROP TABLE` не используются, чужие схемы не удаляются. Схема создаётся из
+  SQLAlchemy `metadata`, а её паритет с Alembic-миграциями проверяет отдельный unit-тест.
+
+E2E-тесты требуют запустить отдельный локальный стенд (`PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true docker compose up -d`) и слушают порт 9000 для
+приёма webhook; адрес хоста из контейнера — `host.docker.internal`. Секрет
+`PAYMENT_WEBHOOK_SECRET` в окружении теста должен совпадать с секретом сервиса.
 
 ## Структура
 
 ```
 src/payment/
 ├── domain/          # агрегат Payment, value objects, события (не знает о фреймворках)
-├── application/     # use cases (create/process/get/publish_outbox) + порты
+├── application/     # сервисы сценариев (PaymentService, WebhookService, OutboxService) + порты
 ├── adapters/        # persistence (SQLAlchemy), messaging (FastStream), gateway, webhook
-├── entrypoints/     # api (FastAPI), consumer (FastStream), relay (поллинг outbox)
+├── entrypoints/     # api (FastAPI), единый consumer, relay
 └── bootstrap.py     # composition root
 
 tests/
-├── unit/            # домен + use cases на fake-портах
-├── integration/     # репозитории, UoW, outbox на реальном PostgreSQL
+├── unit/            # домен, сервисы на fake-портах, конфиг, топология, fencing
+├── integration/     # репозитории, UoW, outbox, клеймы на реальном PostgreSQL
 └── e2e/             # API → outbox → consumer → webhook
 ```

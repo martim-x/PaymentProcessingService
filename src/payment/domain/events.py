@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from payment.domain.model.enums import Currency
@@ -15,7 +16,7 @@ class PaymentCreated:
     currency: Currency
     idempotency_key: str
     webhook_url: str
-    metadata: dict
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,176 +1,228 @@
 # Архитектура Payment Processing Service
 
-Полное описание устройства сервиса: слои, сущности, поток платежа и схема надёжности.
-Запуск и примеры запросов: [`README.md`](../README.md).
-Схема архитектуры — `docs/architecture.excalidraw` (локально, в репозиторий не входит).
+Этот документ — карта проекта для чтения кода и ревью: где искать сценарий, какие объекты за что отвечают и через какие связи проходит управление. Он описывает текущие файлы, а не только учебную модель.
 
+- Запуск, HTTP-примеры и ограничения эксплуатации: [`README.md`](../README.md).
+- Визуальная схема не входит в репозиторий; актуальная текстовая схема потоков приведена ниже.
 
-## Общая картина
+## Процессы и конвейеры
 
-Сервис принимает запрос на оплату, асинхронно обрабатывает его через эмуляцию
-платёжного шлюза и уведомляет клиента через webhook. Состоит из четырёх
-независимых процессов (контейнеров):
+Сервис состоит из пяти процессов: `api`, `relay` и единственный `consumer` работают постоянно, `migrate` — одноразовый, плюс инфраструктурные PostgreSQL и RabbitMQ. Отдельного активного webhook-worker в Compose нет.
 
 | Процесс | Роль | Точка входа |
 |---|---|---|
-| **api** | HTTP-интерфейс (FastAPI) | `payment.entrypoints.api.app:app` |
-| **relay** | Публикация событий из outbox в RabbitMQ | `payment.entrypoints.relay.runner` |
-| **consumer** | Обработка платежа (FastStream) | `payment.entrypoints.consumer.app` |
-| **migrate** | Миграции Alembic (одноразовый) | `alembic upgrade head` |
+| **api** | HTTP-интерфейс: приём платежа, чтение статуса | `payment.entrypoints.api.app:app` |
+| **relay** | Поллинг outbox и публикация событий в RabbitMQ | `payment.entrypoints.relay.runner` |
+| **consumer** | Одна активная подписка `payments.new`; единый handler обрабатывает платёж, затем webhook до ACK | `payment.entrypoints.consumer.app` |
+| **migrate** | `alembic upgrade head` перед стартом остальных | сервис `migrate` в `docker-compose.yml` |
 
-## Слои (правило: зависимости направлены только внутрь)
+Путь обработки проходит через outbox и единственный consumer:
 
+```text
+POST /api/v1/payments
+  api ── INSERT payments + outbox(payment.created) ── одной транзакцией ──▶ PostgreSQL
+                                                                              ▲
+relay ── SELECT ... WHERE sent=false AND failed=false AND dispatch='relay' FOR UPDATE SKIP LOCKED ─┘
+  └─ payment.created → payments.new
+
+`payments.new → единственный handler → PaymentService.process_payment → claim → шлюз → финальный статус + outbox(payment.webhook)`
+`outbox(payment.webhook) [dispatch=local: relay её не видит; sent не выставляется]`
+`                 → WebhookService.deliver → HTTP → webhook_deliveries.status`
+`                 → ack | retry через payments.new TTL-цепочку | payments.dlq`
 ```
-entrypoints → bootstrap → adapters → application → domain
-                              ↘ application/ports (интерфейсы)
+
+Consumer регистрирует только подписку `payments.new`. Один handler последовательно вызывает обработку платежа, затем `WebhookService.deliver`, и подтверждает исходное сообщение после обоих шагов. Второго конвейера и второй очереди нет. Финализация платежа сохраняет команду уведомления в outbox с `dispatch='local'`: relay такие строки не выбирает, `sent` остаётся честным флагом публикации. Результат HTTP-доставки фиксируется в `webhook_deliveries`.
+
+## С чего начать чтение
+
+Создание платежа:
+
+`entrypoints/api/routers/payments.py` → `application/services/payment_service.py` (`create_payment`) → `domain/model/payment.py` и порты → реализации в `adapters/persistence/`.
+
+Обработка платежа:
+
+`entrypoints/consumer/app.py` → `application/services/payment_service.py` (`process_payment`) → доменный `Payment` и порты → адаптеры шлюза и БД. Затем consumer вызывает `WebhookService.deliver` до ACK.
+
+Публикация события:
+
+`entrypoints/relay/runner.py` → `application/services/outbox_service.py` (`publish_pending`) → порт publisher/repository → адаптеры PostgreSQL и RabbitMQ.
+
+Доставка webhook вызывается внутри обработчика: `entrypoints/consumer/app.py` → `application/services/webhook_service.py` (`deliver`) → порты `WebhookSender` и `WebhookDeliveryRepository`.
+
+## Главное правило зависимостей
+
+```text
+Внешний мир → entrypoints → application → domain
+                         adapters ────────┘
+                         bootstrap связывает реализации с портами
 ```
 
-### 1. `src/payment/domain/` — чистая бизнес-логика
+- **Domain** содержит понятия и правила предметной области. Он не должен зависеть от FastAPI, SQLAlchemy или FastStream.
+- **Application** описывает сценарии и нужные им интерфейсы (порты). Сценарий зависит от контракта, например `PaymentGateway`, а не от конкретного шлюза.
+- **Adapters** реализуют порты через технологии: БД, брокер, HTTP.
+- **Entrypoints** принимают внешние запросы/сообщения и вызывают сценарии.
+- **`bootstrap.py`** собирает конкретные реализации вместе. Это composition root, а не бизнес-слой.
 
-Ни одной строчки про FastAPI/SQLAlchemy/брокер. Слой можно тестировать без Docker.
+Направление вызова во время работы и направление зависимости — не одно и то же. Например, сервис вызывает порт publisher, а конкретный `FastStreamPublisher` находится снаружи и реализует этот порт.
 
-- **`model/payment.py` — агрегат `Payment`** (Aggregate Root). Единственный владелец
-  статуса. Бизнес-правила: новый платёж всегда `pending`; финальный статус
-  (`succeeded`/`failed`) поменять нельзя (`InvalidStatusTransition`). Каждое изменение
-  статуса порождает доменное событие, которое собирается в буфер (`collect_events`).
-- **`model/value_objects.py`** — неизменяемые обёртки с валидацией:
-  - `Money(amount: Decimal, currency)` — только положительная сумма, нормализация до
-    4 знаков (соответствует `Numeric(19,4)` в БД). Никогда не `float`.
-  - `IdempotencyKey` — непустая строка ≤ 255 символов, уникальный ключ защиты от дублей.
-  - `WebhookUrl` — только http/https.
-  - `PaymentId` — UUID.
-- **`model/enums.py`** — `Currency` (RUB/USD/EUR), `PaymentStatus` (pending/succeeded/failed).
-- **`model/fingerprint.py`** — `compute_fingerprint()`: sha256 канонического JSON тела
-  (sort_keys, separators). Используется API-слоем: тот же `Idempotency-Key` + тот же
-  fingerprint → вернуть существующий платёж; другой fingerprint → `409 Conflict`.
-- **`events.py`** — доменные события: `PaymentCreated`, `PaymentSucceeded`, `PaymentFailed`.
-- **`exceptions.py`** — доменные ошибки (`InvalidMoney`, `InvalidStatusTransition`, ...).
-- **`services/retry_policy.py`** — `ExponentialBackoffRetryPolicy`: max_attempts, delay =
-  base · factor^(attempt−1). Чистая математика ретраев, используется webhook-логикой.
+## Каталоги и файлы
 
-### 2. `src/payment/application/` — сценарии и порты
+### `src/payment/domain/` — предметная модель
 
-- **`use_cases/`** — каждый сценарий = один шаг бизнеса:
-  - `create_payment.py` (`CreatePayment`) — идемпотентное создание: платёж **+ запись
-    outbox в одной транзакции** (outbox pattern). Повтор ключа с тем же телом → тот же
-    платёж (`created=False`), с другим телом → `IdempotencyConflict`.
-  - `process_payment.py` (`ProcessPayment`) — загрузка платежа → шлюз → статус →
-    **commit** → webhook. Статус коммитится ДО отправки webhook: недоступный webhook
-    не перекатывает платёж в очередь. Повторное сообщение по уже обработанному
-    платежу — ack без изменений (at-least-once-безопасность).
-  - `get_payment.py` (`GetPayment`) — чтение.
-  - `publish_outbox.py` (`PublishOutbox`) — пакет несент записей outbox → публикация →
-    mark_sent. Падение брокера оставляет записи несент.
-- **`ports/`** — интерфейсы («розетки»), протоколы Python:
-  `repositories.py` (`AbstractUnitOfWork`, `PaymentRepository`, `OutboxRepository`),
-  `payment_gateway.py`, `webhook_sender.py`, `message_publisher.py`.
-- **`dto.py`** — Command/Result-объекты (не Pydantic-схемы API).
-- **`exceptions.py`** — `PaymentNotFound`, `IdempotencyConflict`.
+- `model/payment.py` — `Payment`, агрегатный корень (Aggregate Root) в модели проекта. Создаёт платёж, управляет допустимыми переходами статуса и собирает доменные события. Это основной объект, через который меняется жизненный цикл платежа.
+- `model/value_objects.py` — `Money`, `PaymentId`, `IdempotencyKey`, `WebhookUrl`: значения с проверкой инвариантов. Они описывают смысл данных, а не способ их хранения.
+- `model/enums.py` — допустимые валюты и статусы.
+- `model/fingerprint.py` — канонизация запроса и fingerprint для сравнения повторов ключа идемпотентности.
+- `events.py` — факты домена (`PaymentCreated`, `PaymentSucceeded`, `PaymentFailed`). Они описывают, что произошло; сообщение RabbitMQ — транспортная форма доставки, не само доменное событие.
+- `services/retry_policy.py` — политика расчёта числа/задержки повторов. Это stateless Policy: получает входные значения и рассчитывает результат.
+- `exceptions.py` — ошибки нарушения доменных правил.
 
-### 3. `src/payment/adapters/` — реализации портов на конкретных технологиях
+### `src/payment/application/` — сценарии и их контракты
 
-- **`persistence/`**
-  - `orm.py` — таблицы `payments` и `outbox` (imperative core, без декларативных моделей).
-  - `database.py` — `make_engine` / `make_sessionmaker` (async).
-  - `unit_of_work.py` — `SqlAlchemyUnitOfWork`: сессия на входе в контекст,
-    `commit()` атомарен для payments + outbox.
-  - `repositories/payment.py` — ручной маппинг домена ↔ строки БД.
-  - `repositories/outbox.py` — `fetch_unsent` с `FOR UPDATE SKIP LOCKED`
-    (безопасно при нескольких relay-процессах).
-- **`messaging/`**
-  - `topology.py` — очередь `payments.new`, retry-очереди `payments.new.retry.N`
-    (TTL = 1·2^(N−1) с, dead-letter обратно в main), DLQ `payments.dlq`.
-  - `publisher.py` — `FastStreamPublisher` (реализация `MessagePublisher`).
-  - `schemas.py` — Pydantic-схема payload сообщения.
-- **`gateway/fake_gateway.py`** — эмуляция шлюза: 2–5 сек, 90% успех / 10% ошибка.
-- **`webhook/`** — `http_sender.py` (httpx: сериализация + HMAC + POST с таймаутом),
-  `signer.py` (`X-Signature: t=<ts>,v1=<hex>`, окно по времени), `guard.py` (SSRF).
+Сценарии собраны в три сервиса: `PaymentService`, `WebhookService`, `OutboxService`. Сервис оркестрирует шаги, но не содержит правил допустимых состояний — их проверяет агрегат `Payment`.
 
-### 4. `src/payment/entrypoints/` — двери в мир
+- `services/payment_service.py` — `PaymentService`:
+  - `create_payment(command)`: проверяет идемпотентность, создаёт `Payment`, добавляет запись outbox через UoW и фиксирует их одной транзакцией;
+  - `get_payment(payment_id)`: читает платёж и готовит DTO ответа;
+  - `process_payment(payment_id)`: берёт claim платежа отдельной короткой транзакцией, вызывает шлюз уже без транзакции, затем фиксирует статус (`try_finalize`) и запись outbox `payment.webhook` одной транзакцией. Webhook здесь не отправляется.
+- `services/webhook_service.py` — `WebhookService.deliver(command)`: идемпотентно создаёт задачу доставки, берёт клейм, отправляет HTTP-запрос, записывает итог под fencing token. Повторная доставка после падения между отправкой и записью статуса возможна — это at-least-once.
+- `services/outbox_service.py` — `OutboxService.publish_pending(batch=...)`: читает неотправленные записи, маршрутизирует по `event_type`, публикует и отмечает результат.
+- `ports/` — контракты, необходимые сценариям:
+  - `repositories.py`: `PaymentRepository`, `OutboxRepository`, `WebhookDeliveryRepository`, `AbstractUnitOfWork`, `OutboxRecord`, `WebhookDelivery`;
+  - `payment_gateway.py`: `PaymentGateway`, `GatewayResult`;
+  - `webhook_sender.py`: `WebhookSender`;
+  - `message_publisher.py`: `MessagePublisher`, `PublisherUnavailable`, `PublishRejected`.
+- `dto.py` — объекты передачи данных между входной точкой и сервисом; это не доменные сущности и не API-схемы.
+- `exceptions.py` — ошибки уровня сценариев: платёж не найден, конфликт идемпотентности, `PaymentBusy`, `WebhookBusy`, `WebhookDeliveryFailed`, `WebhookDeliveryExhausted`.
 
-- **`api/`** — FastAPI: роутер `/api/v1/payments`, dependency `X-API-Key` (401),
-  обработчики ошибок (404/409), Pydantic-схемы. `create_app()` собирает приложение.
-- **`consumer/`** — подписчик на `payments.new`. Один обработчик делает всё:
-  `ProcessPayment`. Инфраструктурный сбой (БД и т.п.) → публикация в retry-очередь
-  `attempt` (TTL) → dead-letter обратно в main; после 3 попыток → `payments.dlq`.
-  Номер попытки передаётся в заголовке `x-attempt`, поскольку retry публикует новое сообщение и `x-death` не сохраняется.
-- **`relay/`** — бесконечный цикл: раз в `PAYMENT_RELAY_INTERVAL` сек пакет outbox
-  → RabbitMQ. Корректное завершение по SIGINT/SIGTERM. Политика retry/DLQ —
-  в адаптере `adapters/messaging/routing.py`.
-- **`bootstrap.py`** — composition root (`Container`): единственное место сборки
-  зависимостей. Use case'ы создаются **на запрос/сообщение** — UoW хранит сессию,
-  общий экземпляр смешал бы транзакции параллельных запросов.
+### `src/payment/adapters/` — конкретные реализации контрактов
 
-## Сущности и таблицы
+- `persistence/orm.py` — SQLAlchemy-описание таблиц `payments`, `outbox`, `webhook_deliveries`.
+- `persistence/database.py` — создание async engine и sessionmaker.
+- `persistence/unit_of_work.py` — `SqlAlchemyUnitOfWork`: управляет сессией и транзакцией; коммит атомарен для всех трёх таблиц.
+- `persistence/repositories/payment.py` — преобразует строки БД в `Payment` и обратно; выполняет запросы платежей и claim/finalize.
+- `persistence/repositories/outbox.py` — запросы и обновление записей outbox, `fetch_unsent` с `FOR UPDATE SKIP LOCKED`.
+- `persistence/repositories/webhook.py` — задача доставки: `create_if_absent`, `try_claim`, `release_claim`, `mark_delivered`, `mark_attempt_failed`; все переходы условны по токену клейма.
+- `messaging/publisher.py` — `FastStreamPublisher`, реализация порта `MessagePublisher`; различает недоступность транспорта и отказ конкретной записи.
+- `messaging/topology.py` — объявления основной очереди, двух лестниц retry (`retry.N` и `infra.retry.N`) и DLQ; бюджет отказов у лестниц общий.
+- `messaging/routing.py` — выбор маршрута при неудачной обработке и номер попытки.
+- `messaging/redelivery.py` — публикация копии в retry/DLQ и только затем `ack`; при сбое публикации — `nack requeue`.
+- `messaging/schemas.py` — структура транспортных сообщений (`PaymentCreatedMessage`, `WebhookDeliveryMessage`).
+- `messaging/connection.py` — подключение к брокеру с повторами.
+- `gateway/fake_gateway.py` — тестовая эмуляция внешнего платёжного шлюза, реализация `PaymentGateway`.
+- `webhook/http_sender.py` — HTTP-отправка webhook, реализация `WebhookSender`.
+- `webhook/signer.py` — сериализация и HMAC-подпись тела webhook.
+- `webhook/guard.py` — проверка адреса webhook и защита от SSRF.
 
-### `payments`
+### `src/payment/entrypoints/` — входы в приложение
 
-| Поле | Тип в БД | Домен |
+- `api/app.py` — создание FastAPI-приложения, lifespan, `/health`.
+- `api/routers/payments.py` — HTTP-маршруты создания/получения платежа; преобразуют запрос в команду и вызывают `PaymentService`.
+- `api/schemas.py` — Pydantic-модели HTTP-запроса/ответа и лимиты полей. Это формат API, не доменная модель.
+- `api/dependencies.py` — проверка `X-API-Key`, `Idempotency-Key` и создание `PaymentService` для запроса.
+- `api/error_handlers.py` — отображение ошибок приложения/домена в HTTP-ответы.
+- `consumer/app.py` — регистрирует одну подписку на `payments.new`. Её handler вызывает `PaymentService.process_payment`, затем `WebhookService.deliver`, и подтверждает сообщение после успеха. Ошибки маршрутизируют исходное сообщение через retry/DLQ основного конвейера. Второй очереди и второго consumer'а нет: весь путь — одна подписка.
+
+- `relay/runner.py` — периодически запускает публикацию outbox и обрабатывает завершение процесса.
+
+### Сборка и конфигурация
+
+- `bootstrap.py` — `Container`: создаёт адаптеры, брокер с каналом (prefetch, publisher confirms, `on_return_raises`) и фабрики сервисов (свой UoW на каждый экземпляр). Здесь одна политика бюджета попыток и две базы задержки: обычные ретраи и более медленные инфраструктурные.
+- `config.py` — настройки окружения и проверка их совместимости (см. ниже).
+- `migrations/versions/20261118_0001_initial.py` — `payments` и `outbox`.
+- `migrations/versions/20261119_0002_webhook_deliveries.py` — `webhook_deliveries` и индекс `ix_outbox_event_type`.
+- `docker-compose.yml` — postgres, rabbitmq (с volume), migrate, api, relay и один consumer.
+
+## Состояние: что и где хранится
+
+| Таблица | Ключевые поля | Смысл |
 |---|---|---|
-| id | UUID PK | `PaymentId` |
-| amount | Numeric(19,4) | `Money.amount` |
-| currency | varchar(3) | `Money.currency` |
-| description | text | str |
-| metadata | JSONB | dict |
-| status | varchar(16) | `PaymentStatus` |
-| fingerprint | varchar(64) | sha256 тела запроса (для 409) |
-| idempotency_key | varchar(255) UNIQUE | `IdempotencyKey` |
-| webhook_url | text | `WebhookUrl` |
-| failure_reason | text | причина ошибки шлюза |
-| created_at / processed_at | timestamptz | даты создания/обработки |
+| `payments` | `id`, `amount Numeric(19,4)`, `currency`, `status`, `idempotency_key UNIQUE`, `fingerprint`, `webhook_url`, `locked_until` | Платёж и его жизненный цикл `pending → succeeded/failed`; `locked_until` — клейм обработки |
+| `outbox` | `id`, `aggregate_id`, `event_type`, `payload JSONB`, `sent`, `dispatch`, `failed`, `attempts` | Журнал событий: `payment.created` (`dispatch=relay`) публикуется relay; `payment.webhook` (`dispatch=local`) хранится для возобновления доставки и никогда не публикуется |
+| `webhook_deliveries` | `event_id PK`, `payment_id`, `status`, `attempts`, `last_error`, `locked_until`, `delivered_at` | Фактический статус и попытки HTTP-доставки; ключ — стабильный `event_id` из outbox |
 
-### `outbox`
+`event_type` в outbox — не косметика: relay выбирает по нему очередь. Если типа нет ни в `event_type`, ни в `payload["event"]`, запись уходит в очередь по умолчанию (`payments.new`) и, скорее всего, будет отбракована consumer'ом как poison.
 
-| Поле | Тип | Назначение |
-|---|---|---|
-| id | UUID PK | идентификатор записи |
-| aggregate_id | varchar(64) | id платежа |
-| event_type | varchar(64) | `payment.created` |
-| payload | JSONB | тело сообщения для брокера |
-| created_at | timestamptz | порядок публикации |
-| sent / sent_at | bool / timestamptz | журнал доставки |
+## Инварианты и где они проверяются
 
-Индекс `ix_outbox_unsent (sent, created_at)` — поллинг relay'я.
-
-## Поток платежа (счастливый путь)
-
-```mermaid
-flowchart LR
-    C[Клиент] -->|POST /payments| API[api]
-    API -->|1 транзакция| PG[("payments + outbox")]
-    R[relay] -->|каждую сек| PG
-    R -->|publish| MQ([payments.new])
-    MQ --> CON[consumer]
-    CON -->|2-5 сек, 90/10| GW[шлюз эмуляция]
-    CON -->|status commit| PG
-    CON -->|webhook + HMAC| C2[webhook_url клиента]
-```
-
-1. **POST /api/v1/payments** → `202 Accepted`, `payment_id`, статус `pending`.
-2. В той же транзакции: строка `payments` + строка `outbox`.
-3. **relay** публикует событие в `payments.new`, помечает `sent`.
-4. **consumer** вызывает шлюз, меняет статус, коммитит, отправляет webhook.
-5. Клиент читает статус через **GET /api/v1/payments/{id}**.
-
-## Гарантии доставки
-
-| Механизм | Реализация |
+| Инвариант | Где закреплён |
 |---|---|
-| Outbox pattern | Событие в outbox в той же транзакции, что и платёж; relay публикует позже |
-| Идемпотентность | unique index на `idempotency_key` + fingerprint тела → 409 на конфликт; consumer идемпотентен к дублям |
-| Retry consumer'а | очереди `*.retry.N` с `x-message-ttl`, dead-letter обратно в `payments.new`; до 3 попыток |
-| DLQ | после 3 попыток → `payments.dlq`; из main — по `x-dead-letter` |
-| Retry webhook | 3 попытки с экспоненциальной задержкой в `ProcessPayment` (исход на статус не влияет) |
+| Финальный статус платежа нельзя изменить | `Payment.mark_succeeded/mark_failed` → `InvalidStatusTransition` |
+| Платёж и его событие появляются вместе | `PaymentService._create_payment` и `PaymentService._finalize` в одном UoW |
+| Один платёж не обрабатывают параллельно | `try_claim` (условный `UPDATE` по `status='pending'` и свободному `locked_until`) |
+| Итог обработки может записать только владелец клейма | `try_finalize` фильтрует по `locked_until = claim_token` |
+| Один webhook не отправляют параллельно | `webhook_deliveries.try_claim` + `mark_delivered/mark_attempt_failed` по токену |
+| Дубликат сообщения не создаёт вторую задачу доставки | `create_if_absent` (`ON CONFLICT DO NOTHING` по `event_id`) |
+| Повтор API с тем же ключом не создаёт платёж | unique `idempotency_key` + fingerprint; гонка → перечитывание |
+| Повтор с другим телом не проходит | сравнение fingerprint → `IdempotencyConflict` → `409` |
+| Сообщение не теряется при сбое публикации retry/DLQ | `redelivery.publish_or_requeue` (сначала publish, потом ack) |
+| Падение брокера не «сжигает» outbox | `PublisherUnavailable` не увеличивает `attempts` |
+| Тайминги клеймов и ретраев согласованы | `Settings`-валидаторы в `config.py` |
+| Схема миграций совпадает с `metadata` | `tests/unit/test_migration_schema_parity.py` |
 
-## Тесты
+Числовые значения (TTL 35/70 с, бюджеты клеймов) и их обоснование — в [`README.md`](../README.md#надёжность).
 
-- `tests/unit/domain/` — value objects, агрегат, переходы статусов, fingerprint, retry policy.
-- `tests/unit/application/` — use cases на fake-портах (`tests/fakes/`).
-- Адаптеры и entrypoints — смоук-импорт + e2e в docker compose (см. README).
+## Текущий runtime и границы документации
 
-## Как запустить
+1. **Один активный конвейер consumer.** `docker-compose.yml` запускает consumer, который подписывается только на `payments.new`. Один handler выполняет `PaymentService.process_payment`, затем `WebhookService.deliver` до ACK. Других очередей и consumer'ов нет.
+2. **Сохранённый payload webhook не означает его отправку.** Во время финализации команда `payment.webhook` пишется в outbox с `dispatch='local'`: relay её не читает, `sent` не выставляется. Результат реальной HTTP-доставки ведётся в `webhook_deliveries`.
+3. **Повторная обработка.** Финализированный платёж не должен повторно проходить шлюз; при сбое webhook исходное сообщение `payments.new` повторяется, а `webhook_deliveries` обеспечивает сохранение состояния и идемпотентность доставки.
+4. **`event_id` — стаб.** `PaymentService.process_payment` генерирует `uuid4().hex` при финализации. Он стабилен для всех попыток доставки одного события (едет в outbox и в сообщении), но не выводится из состояния платежа и не является бизнес-ключом. В реальной системе это был бы id записи outbox или детерминированный ключ события.
+5. **Гарантия — at-least-once, не exactly-once.** Дубли возможны в очереди (перепубликация) и в доставке (падение между HTTP-ответом и записью `delivered`). Защита — ключи идемпотентности: `Idempotency-Key`, id платежа как ключ шлюза, `event_id` у получателя.
+6. **Relay публикует внутри транзакции.** `FOR UPDATE SKIP LOCKED` берётся при выборке, `commit` — после публикации батча. Это упрощает код (нет статуса «publishing» и reclaim-логики), но блокировки строк живут, пока идёт публикация.
 
-```bash
-docker compose up --build     # postgres, rabbitmq, api, relay, consumer, migrate
-```
-Swagger: http://localhost:8000/docs · RabbitMQ UI: http://localhost:15673
+Полный список эксплуатационных ограничений — в [`README.md`](../README.md#ограничения-осознанные).
+
+## Безопасность: где в коде и чего нет
+
+| Контроль | Где | Граница |
+|---|---|---|
+| `X-API-Key` | `api/dependencies.py`, `hmac.compare_digest` | Один статический ключ, без ротации и скоупов |
+| Секреты обязательны | `config.py` (`_INSECURE_DEFAULTS`) | Только env/compose, без vault |
+| SSRF-гард | `webhook/guard.py`, `WebhookUrl` | Приватные адреса запрещены по умолчанию; для E2E разрешаются явно. DNS-проверка не исключает rebinding |
+| HMAC-подпись | `webhook/signer.py` | Один общий секрет на всех получателей |
+| Валидация входа | `api/schemas.py`, `api/dependencies.py` | Нет лимита на тело целиком и rate limiting |
+| Непривилегированный контейнер | `Dockerfile` (uid 10001) | Инфраструктура (RabbitMQ UI, PostgreSQL) опубликована на хост |
+
+Чего в сервисе нет: TLS, ротации ключей, per-endpoint секретов, шифрования at-rest, аудита доступа, антифрода и аутентификации на DLQ/management UI. Это осознанные границы учебного проекта; перечень — в [`README.md`](../README.md#ограничения-безопасности).
+
+## Назначение основных абстракций
+
+| Абстракция | Простыми словами | Где искать |
+|---|---|---|
+| Entity | Объект с идентичностью и меняющимся состоянием | `Payment` |
+| Value Object | Значение с правилами, без отдельной идентичности | `Money`, `PaymentId`, `WebhookUrl` |
+| Aggregate Root | Единственная точка изменения агрегата; защищает его инварианты | `Payment` |
+| Domain Event | Факт, уже произошедший в домене | `PaymentCreated`, `PaymentSucceeded` |
+| Policy | Отдельное stateless-правило: входные данные → решение/расчёт | `ExponentialBackoffRetryPolicy` |
+| Application service | Один прикладной сценарий (набор методов), координирующий шаги | `PaymentService`, `WebhookService`, `OutboxService` |
+| Port | Контракт того, что сценарию требуется от внешнего мира | `PaymentGateway`, `WebhookDeliveryRepository` |
+| Adapter | Технологическая реализация порта | `FakePaymentGateway`, `SqlAlchemyWebhookDeliveryRepository` |
+| DTO | Данные, передаваемые между границами сценария | `CreatePaymentCommand`, `PaymentDetails` |
+| Unit of Work | Граница транзакции и совместной фиксации изменений | `AbstractUnitOfWork`, `SqlAlchemyUnitOfWork` |
+| Composition root | Место, где выбираются и соединяются реализации | `Container` в `bootstrap.py` |
+
+## Что означает DDD здесь, а что не следует додумывать
+
+Проект использует отдельные доменные объекты, value objects, доменные события, сценарии и порты. `Payment` выступает агрегатным корнем для своего жизненного цикла. Это не означает, что любой файл — «DDD-паттерн» или что проект реализует все концепции DDD.
+
+`ExponentialBackoffRetryPolicy` — конкретная policy расчёта retry-задержки. Это не универсальный процессный менеджер и не доказательство того, что вся система построена вокруг богатой доменной модели. `PaymentCreated` — доменное событие; `PaymentCreatedMessage`/сообщение очереди — формат передачи события между процессами. `payment.webhook` — транспортное событие доставки, у него нет доменного двойника.
+
+В этом сервисе один bounded context — обработка платежей. В системе из нескольких контекстов, например заказов и платежей, их модели не нужно объединять в один агрегат: обычно они связываются идентификаторами и событиями. Здесь отдельный `Order`-контекст не реализован.
+
+## Как читать тесты
+
+- `tests/unit/` — домен, сервисы на fake-портах, конфигурационные инварианты, топология и маршрутизация, fencing-предикаты SQL, паритет схемы миграций.
+- `tests/integration/` — репозитории, UoW, outbox и клеймы на реальном PostgreSQL. DSN берётся только из `PAYMENT_TEST_DATABASE_URL`; без неё набор скипается, fallback на рабочую БД запрещён.
+- `tests/e2e/` — полный поток против compose, включая проверку HMAC от сырых байтов.
+
+## Быстрый ориентир для ревью
+
+1. Начни с entrypoint и найди сервис, который он вызывает.
+2. В сервисе выпиши порядок шагов и порты, от которых он зависит.
+3. Перейди в домен: проверь, что инварианты и переходы состояния защищаются самим `Payment`.
+4. Для каждого порта найди адаптер и проверь преобразование данных и обработку ошибок.
+5. Проверь тесты для успешного пути, повторного сообщения и сбоя между шагами.
+6. Для фоновых гарантий отдельно проверь, где заканчивается транзакция и где начинается сетевой вызов.
+
+Если непонятно, кто владеет правилом: правило допустимости состояния относится к Domain; порядок действий сценария — Application; преобразование к SQL/HTTP/RabbitMQ — Adapter или Entrypoint.

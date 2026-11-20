@@ -148,6 +148,16 @@ class TestFullFlow:
             r = client.get(f"{API_URL}/api/v1/payments/{uuid.uuid4()}")
             assert r.status_code == 401
 
+    @pytest.mark.parametrize(
+        ("headers", "expected_status"),
+        [({}, 401), ({"X-API-Key": "wrong-key"}, 401), ({"X-API-Key": API_KEY}, 200)],
+    )
+    def test_health_requires_api_key(self, headers: dict[str, str], expected_status: int) -> None:
+        response = httpx.get(f"{API_URL}/health", headers=headers, timeout=10.0)
+        assert response.status_code == expected_status
+        if expected_status == 200:
+            assert response.json() == {"status": "ok"}
+
     def test_unknown_payment_404(self) -> None:
         with httpx.Client(timeout=10.0) as client:
             r = client.get(

@@ -2,17 +2,16 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from payment.application.dto import CreatePaymentCommand, PaymentDetails
-from payment.application.use_cases.create_payment import CreatePayment
-from payment.application.use_cases.get_payment import GetPayment
+from payment.application.services.payment_service import PaymentService
 from payment.domain.model.enums import Currency
 from payment.domain.model.value_objects import IdempotencyKey, PaymentId, to_decimal
 from payment.entrypoints.api.dependencies import (
-    build_create_payment,
-    build_get_payment,
+    build_payment_service,
     require_api_key,
+    require_idempotency_key,
 )
 from payment.entrypoints.api.schemas import (
     CreatePaymentRequest,
@@ -44,11 +43,11 @@ def _command(body: CreatePaymentRequest, idempotency_key: str) -> CreatePaymentC
 )
 async def create_payment(
     body: CreatePaymentRequest,
-    idempotency_key: Annotated[str, Header()],
-    use_case: Annotated[CreatePayment, Depends(build_create_payment)],
+    idempotency_key: Annotated[str, Depends(require_idempotency_key)],
+    payment_service: Annotated[PaymentService, Depends(build_payment_service)],
     response: Response,
 ) -> PaymentAcceptedResponse:
-    result = await use_case.execute(_command(body, idempotency_key))
+    result = await payment_service.create_payment(_command(body, idempotency_key))
     if result.created:
         response.headers["Location"] = f"/api/v1/payments/{result.payment.id}"
     return PaymentAcceptedResponse(
@@ -61,7 +60,7 @@ async def create_payment(
 @router.get("/{payment_id}", response_model=PaymentDetailResponse)
 async def get_payment(
     payment_id: str,
-    use_case: Annotated[GetPayment, Depends(build_get_payment)],
+    payment_service: Annotated[PaymentService, Depends(build_payment_service)],
 ) -> PaymentDetails:
     try:
         pid = PaymentId.from_string(payment_id)
@@ -69,4 +68,4 @@ async def get_payment(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found"
         ) from exc
-    return await use_case.execute(pid)
+    return await payment_service.get_payment(pid)

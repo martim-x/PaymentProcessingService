@@ -1,15 +1,30 @@
 """Integration-тесты: репозитории, UoW и outbox на реальном PostgreSQL.
 
-Запуск: pytest tests/integration -q
-Требует PAYMENT_DATABASE_URL (в CI — сервис-контейнер postgres).
+Запуск:
+    PAYMENT_TEST_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/db \\
+        pytest tests/integration -q
+
+Изоляция и безопасность:
+  * URL берётся ТОЛЬКО из PAYMENT_TEST_DATABASE_URL; PAYMENT_DATABASE_URL
+    рабочего стека не подхватывается как fallback (без явной переменной — skip).
+  * Каждый тест работает в собственной временной схеме `pytest_<12 hex>`:
+    search_path сессии содержит только эту схему, без fallback на public.
+  * teardown — `DROP SCHEMA IF EXISTS "<своя схема>" CASCADE`; имя проверяется
+    регуляркой, чужая схема (public, payments, ...) не удаляется никогда.
+  * TRUNCATE и DROP TABLE не используются: данные в public не затрагиваются,
+    даже если DSN указывает на рабочую БД.
 """
 
 import os
-from collections.abc import AsyncIterator
+import re
+import uuid
+from collections.abc import AsyncIterator, Callable, Mapping
 from decimal import Decimal
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from payment.adapters.persistence.orm import metadata
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
@@ -17,24 +32,132 @@ from payment.domain.model.enums import Currency
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import IdempotencyKey, Money, PaymentId, WebhookUrl
 
-DATABASE_URL = os.environ.get(
-    "PAYMENT_DATABASE_URL", "postgresql+psycopg://payment:payment@localhost:5433/payments"
+TEST_DATABASE_URL_ENV = "PAYMENT_TEST_DATABASE_URL"
+APP_DATABASE_URL_ENV = "PAYMENT_DATABASE_URL"
+SCHEMA_PREFIX = "pytest_"
+
+# Изоляция опирается на libpq `options=-csearch_path=...`, т.е. на psycopg3.
+_REQUIRED_DSN_PREFIX = "postgresql+psycopg://"
+_OWN_SCHEMA_RE = re.compile(r"pytest_[0-9a-f]{12}")
+
+
+class UnsafeTestDatabaseError(RuntimeError):
+    """Конфигурация integration-тестов небезопасна — запуск отклоняется."""
+
+
+def resolve_test_database_url(environ: Mapping[str, str]) -> str:
+    """Возвращает DSN тестовой БД или отказывается запускаться.
+
+    Рабочий DSN не используется как значение по умолчанию ни при каких условиях.
+    """
+    url = (environ.get(TEST_DATABASE_URL_ENV) or "").strip()
+    if not url:
+        app_url_set = bool((environ.get(APP_DATABASE_URL_ENV) or "").strip())
+        fallback = (
+            f"; fallback на {APP_DATABASE_URL_ENV} запрещён"
+            if app_url_set
+            else "; значение по умолчанию для рабочей БД запрещено"
+        )
+        raise UnsafeTestDatabaseError(
+            f"{TEST_DATABASE_URL_ENV} не задан — integration-тесты требуют явную тестовую БД"
+            f"{fallback}"
+        )
+    if not url.startswith(_REQUIRED_DSN_PREFIX):
+        raise UnsafeTestDatabaseError(
+            f"{TEST_DATABASE_URL_ENV} должен быть DSN psycopg3 ({_REQUIRED_DSN_PREFIX}...): "
+            "изоляция схемы опирается на libpq options=-csearch_path"
+        )
+    return url
+
+
+def new_schema_name() -> str:
+    """Уникальное имя собственной схемы теста."""
+    return f"{SCHEMA_PREFIX}{uuid.uuid4().hex[:12]}"
+
+
+def drop_schema_sql(schema: str) -> str:
+    """SQL удаления ТОЛЬКО собственной схемы; иначе — отказ."""
+    if not _OWN_SCHEMA_RE.fullmatch(schema):
+        raise UnsafeTestDatabaseError(
+            f"отказ удалять схему {schema!r}: удаляются только схемы вида {SCHEMA_PREFIX}<12 hex>"
+        )
+    return f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'
+
+
+async def drop_own_schema(url: str, schema: str) -> None:
+    """Удаляет схему теста на отдельном соединении с обычным search_path."""
+    sql = drop_schema_sql(schema)  # имя проверено до подключения
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql("SET LOCAL lock_timeout = '5s'")
+            await conn.exec_driver_sql("SET LOCAL statement_timeout = '10s'")
+            await conn.exec_driver_sql(sql)
+    finally:
+        await engine.dispose()
+
+
+pytestmark = pytest.mark.skipif(
+    not (os.environ.get(TEST_DATABASE_URL_ENV) or "").strip(),
+    reason=(
+        f"{TEST_DATABASE_URL_ENV} не задан: integration-тесты не запускаются "
+        f"на рабочей БД ({APP_DATABASE_URL_ENV})"
+    ),
 )
+
+UowFactory = Callable[[], SqlAlchemyUnitOfWork]
 
 
 @pytest.fixture
-async def uow_factory() -> AsyncIterator:
-    engine = create_async_engine(DATABASE_URL)
-    # create_all идемпотентен: не трогает схему, созданную alembic,
-    # и не сносит таблицы живого стека (drop_all здесь запрещён)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
-    yield lambda: SqlAlchemyUnitOfWork(sessionmaker)
-    async with engine.begin() as conn:
-        for table in ("outbox", "payments"):
-            await conn.exec_driver_sql(f"TRUNCATE {table} CASCADE")
-    await engine.dispose()
+async def uow_factory() -> AsyncIterator[UowFactory]:
+    url = resolve_test_database_url(os.environ)
+    schema = new_schema_name()
+
+    engine = create_async_engine(
+        url,
+        pool_pre_ping=True,
+        # Без public отсутствующая таблица не попадёт в чужую схему.
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    created = False
+    try:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+            created = True
+            # проверка ДО любого DDL: если драйвер проигнорировал `options`,
+            # create_all создал бы таблицы в public — этого делать нельзя
+            search_path = await conn.scalar(sa.text("SELECT current_setting('search_path')"))
+            schemas = [part.strip() for part in str(search_path).split(",")]
+            if not schemas or schemas[0] != schema:
+                raise UnsafeTestDatabaseError(
+                    f"search_path={search_path!r} не начинается с {schema}: "
+                    "изоляция схемы не действует, запуск прерван без изменений в БД"
+                )
+            # checkfirst=False: инспекция таблиц идёт по search_path и могла бы
+            # найти таблицы из public; схема только что создана и пуста
+            await conn.run_sync(metadata.create_all, checkfirst=False)
+            resolved = await conn.scalar(
+                sa.text(
+                    "SELECT n.nspname FROM pg_class AS c "
+                    "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                    "WHERE c.oid = to_regclass('payments')"
+                )
+            )
+
+        if resolved != schema:
+            raise UnsafeTestDatabaseError(
+                f"payments резолвится в {resolved!r}, а не в {schema}: "
+                "прерываю, чтобы не писать в чужую схему"
+            )
+
+        sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+        yield lambda: SqlAlchemyUnitOfWork(sessionmaker)
+    finally:
+        # сначала закрываем пул: «повисшая» сессия теста держала бы блокировки
+        # на таблицах схемы и мешала её удалению
+        await engine.dispose()
+        if created:
+            await drop_own_schema(url, schema)
 
 
 def make_payment(key: str = "key-int-1") -> Payment:
@@ -118,8 +241,7 @@ class TestProcessPaymentPersistStatus:
 
     async def test_process_persists_succeeded(self, uow_factory) -> None:
         from payment.application.ports.payment_gateway import GatewayResult
-        from payment.application.use_cases.process_payment import ProcessPayment
-        from tests.fakes import FakeWebhookSender
+        from payment.application.services.payment_service import PaymentService
 
         uow = uow_factory()
         payment = make_payment("key-proc-1")
@@ -134,10 +256,8 @@ class TestProcessPaymentPersistStatus:
             ) -> GatewayResult:
                 return GatewayResult(succeeded=True)
 
-        use_case = ProcessPayment(
-            uow=uow_factory(), gateway=OkGateway(), webhook_sender=FakeWebhookSender()
-        )
-        result = await use_case.execute(pid)
+        service = PaymentService(uow=uow_factory(), gateway=OkGateway())
+        result = await service.process_payment(pid)
 
         async with uow_factory() as w:
             loaded = await w.payments.get(pid)
@@ -235,6 +355,21 @@ class TestProcessPaymentPersistStatus:
 
 
 class TestOutboxRepository:
+    async def test_mark_attempt_failed_persists_even_without_publish(self, uow_factory) -> None:
+        async with uow_factory() as uow:
+            record = await uow.outbox.add(payload={"n": 1}, aggregate_id="a1")
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            failed = await uow.outbox.mark_attempt_failed(record.id, max_attempts=3)
+            await uow.commit()
+        assert failed is False
+
+        async with uow_factory() as uow:
+            records = await uow.outbox.fetch_unsent(batch=10)
+        assert len(records) == 1
+        assert records[0].attempts == 1
+
     async def test_fetch_unsent_returns_only_unsent(self, uow_factory) -> None:
         async with uow_factory() as uow:
             r1 = await uow.outbox.add(payload={"n": 1}, aggregate_id="a1")

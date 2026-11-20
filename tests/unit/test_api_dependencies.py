@@ -1,50 +1,98 @@
-"""Жизненный цикл UoW: use case создаётся на запрос, а не на приложение."""
+"""Жизненный цикл UoW: сервис создаётся на запрос, а не на приложение."""
 
+import os
 import uuid
 from types import SimpleNamespace
 
+os.environ.setdefault("PAYMENT_API_KEY", "safe-test-api-key")
+os.environ.setdefault("PAYMENT_WEBHOOK_SECRET", "safe-test-webhook-secret")
+
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
-from payment.entrypoints.api.dependencies import build_create_payment, build_get_payment
+from payment.entrypoints.api.dependencies import build_payment_service
 from payment.entrypoints.api.routers.payments import _command
 from payment.entrypoints.api.schemas import CreatePaymentRequest
 
 
 class CountingContainer:
-    """Минимальный контейнер: считает, сколько use case'ов создано."""
+    """Минимальный контейнер: считает, сколько сервисов создано."""
 
     def __init__(self) -> None:
         self.created = []
 
-    def create_payment(self):
-        use_case = object()
-        self.created.append(use_case)
-        return use_case
-
-    def get_payment(self):
-        use_case = object()
-        self.created.append(use_case)
-        return use_case
+    def payment_service(self):
+        service = object()
+        self.created.append(service)
+        return service
 
 
 def fake_request(container: CountingContainer) -> SimpleNamespace:
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(container=container)))
 
 
-class TestPerRequestUseCase:
-    def test_each_request_gets_its_own_use_case(self) -> None:
+class TestPerRequestService:
+    def test_each_request_gets_its_own_service(self) -> None:
         container = CountingContainer()
         request = fake_request(container)
 
-        first = build_create_payment(request)
-        second = build_create_payment(request)
-        third = build_get_payment(request)
+        first = build_payment_service(request)
+        second = build_payment_service(request)
+        third = build_payment_service(request)
 
         assert first is not second
         assert len(container.created) == 3
         assert third is container.created[2]
+
+
+class TestApiRoutesAuthentication:
+    def test_docs_endpoints_are_disabled_and_api_auth_is_unchanged(self) -> None:
+        import sys
+
+        sys.modules.pop("payment.entrypoints.api.app", None)
+        from payment.entrypoints.api.app import create_app
+
+        settings = SimpleNamespace(api_key="test-api-key")
+        container = SimpleNamespace(settings=settings, payment_service=lambda: object())
+        app = create_app(container)  # type: ignore[arg-type]
+        client = TestClient(app)
+
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert client.get(path).status_code == 404
+
+        assert client.get("/health").status_code == 401
+        assert client.get("/health", headers={"X-API-Key": "test-api-key"}).status_code == 200
+        assert (
+            client.get("/api/v1/payments/00000000-0000-0000-0000-000000000000").status_code == 401
+        )
+        assert (
+            client.get(
+                "/api/v1/payments/not-a-uuid", headers={"X-API-Key": "test-api-key"}
+            ).status_code
+            == 404
+        )
+
+    def test_openapi_schema_is_served_only_with_the_api_key(self) -> None:
+        """Схема доступна без Swagger UI, но только под X-API-Key."""
+        import sys
+
+        sys.modules.pop("payment.entrypoints.api.app", None)
+        from payment.entrypoints.api.app import create_app
+
+        settings = SimpleNamespace(api_key="test-api-key")
+        container = SimpleNamespace(settings=settings, payment_service=lambda: object())
+        client = TestClient(create_app(container))  # type: ignore[arg-type]
+
+        assert client.get("/api/v1/openapi.json").status_code == 401
+
+        response = client.get("/api/v1/openapi.json", headers={"X-API-Key": "test-api-key"})
+
+        assert response.status_code == 200
+        schema = response.json()
+        assert "/api/v1/payments" in schema["paths"]
+        assert "/health" in schema["paths"]
 
 
 class TestUnitOfWorkReentryGuard:
@@ -91,12 +139,12 @@ class TestCommandBuilding:
 
 class TestRouterWiring:
     def test_router_uses_request_scoped_factory(self) -> None:
-        """Зависимость роутера обязана быть фабрикой, а не готовым объектом."""
+        """FastAPI Dependency должна ссылаться на фабрику сервиса."""
         app = FastAPI()
 
         @app.get("/probe")
-        async def probe(x: object = build_create_payment) -> dict:  # noqa: B008 — проверка ссылки
+        async def probe(x: object = build_payment_service) -> dict:  # noqa: B008 — проверка ссылки
             return {"ok": True}
 
-        assert build_create_payment.__name__ == "build_create_payment"
+        assert build_payment_service.__name__ == "build_payment_service"
         assert app is not None

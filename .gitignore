@@ -34,3 +34,4 @@ AGENTS.md
 # Схемы (не публикуем: ни исходник, ни рендер)
 docs/*.excalidraw
 docs/*.png
+docs/*.svg

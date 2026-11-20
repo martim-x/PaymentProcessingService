@@ -6,6 +6,8 @@ from typing import Protocol
 
 @dataclass(frozen=True, slots=True)
 class GatewayResult:
+    """Итог вызова шлюза: отказ — succeeded=False с причиной, а не исключение."""
+
     succeeded: bool
     reason: str | None = None
 
@@ -14,5 +16,9 @@ class PaymentGateway(Protocol):
     async def process(
         self, *, payment_id: str, amount: object, currency: str, idempotency_key: str = ""
     ) -> GatewayResult:
-        """idempotency_key защищает от повторного списания у реального шлюза."""
+        """Проводит списание; бизнес-отказ возвращается как GatewayResult.
+
+        Исключение означает сбой транспорта или таймаут — это повод для retry
+        сообщения. idempotency_key защищает от повторного списания при повторе.
+        """
         ...
