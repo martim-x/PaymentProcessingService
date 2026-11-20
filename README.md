@@ -341,6 +341,13 @@ PAYMENT_E2E_WEBHOOK_PORT=9000 \
   venv/bin/python -m pytest tests/e2e/test_failed_webhook_dlq.py -q
 ```
 
+Флаг `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true` нужен не только первому `docker
+compose up`: каждый `up`/`start` пересоздаёт consumer и подставляет значение заново
+из окружения. Если флаг потерян, SSRF-гард отклоняет `host.docker.internal`
+(`private address 172.17.0.1`), и webhook-сценарии видят 0 HTTP-запросов.
+`scripts/chaos_kill9.sh` поэтому запоминает флаг у работающего consumer'а и
+восстанавливает его при пересоздании.
+
 `scripts/chaos_kill9.sh` выполняется и в CI (job **E2E**), поэтому гарантия
 «платёж не застревает после жёсткого падения» подтверждается автоматически.
 

@@ -18,6 +18,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Контейнер пересоздаётся ниже, а compose подставляет ${PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS}
+# заново из окружения вызывающего. Унаследованный флаг сохраняем, иначе consumer
+# вернётся с запретом приватных адресов и последующие webhook-сценарии получат
+# «private address … for host 'host.docker.internal'» вместо HTTP-запроса.
+ALLOW_PRIVATE="${PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS:-}"
+if [ -z "$ALLOW_PRIVATE" ]; then
+  ALLOW_PRIVATE="$(docker compose exec -T consumer printenv PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS 2>/dev/null || echo false)"
+fi
+export PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS="${ALLOW_PRIVATE:-false}"
+
 API_URL="${PAYMENT_API_URL:-http://localhost:8000}"
 API_KEY="${PAYMENT_API_KEY:-local-dev-key}"
 GATEWAY_SECONDS="${CHAOS_GATEWAY_SECONDS:-20}"
