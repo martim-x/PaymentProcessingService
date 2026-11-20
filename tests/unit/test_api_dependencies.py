@@ -8,7 +8,6 @@ os.environ.setdefault("PAYMENT_API_KEY", "safe-test-api-key")
 os.environ.setdefault("PAYMENT_WEBHOOK_SECRET", "safe-test-webhook-secret")
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
@@ -63,6 +62,7 @@ class TestApiRoutesAuthentication:
             assert client.get(path).status_code == 404
 
         assert client.get("/health").status_code == 401
+        assert client.get("/health", headers={"X-API-Key": "wrong-key"}).status_code == 401
         assert client.get("/health", headers={"X-API-Key": "test-api-key"}).status_code == 200
         assert (
             client.get("/api/v1/payments/00000000-0000-0000-0000-000000000000").status_code == 401
@@ -86,6 +86,10 @@ class TestApiRoutesAuthentication:
         client = TestClient(create_app(container))  # type: ignore[arg-type]
 
         assert client.get("/api/v1/openapi.json").status_code == 401
+        assert (
+            client.get("/api/v1/openapi.json", headers={"X-API-Key": "wrong-key"}).status_code
+            == 401
+        )
 
         response = client.get("/api/v1/openapi.json", headers={"X-API-Key": "test-api-key"})
 
@@ -135,16 +139,3 @@ class TestCommandBuilding:
 
         assert not hasattr(command, "fingerprint")
         assert command.webhook_url == "https://example.com/hook"
-
-
-class TestRouterWiring:
-    def test_router_uses_request_scoped_factory(self) -> None:
-        """FastAPI Dependency должна ссылаться на фабрику сервиса."""
-        app = FastAPI()
-
-        @app.get("/probe")
-        async def probe(x: object = build_payment_service) -> dict:  # noqa: B008 — проверка ссылки
-            return {"ok": True}
-
-        assert build_payment_service.__name__ == "build_payment_service"
-        assert app is not None

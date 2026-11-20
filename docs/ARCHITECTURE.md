@@ -7,7 +7,7 @@
 
 ## Процессы и конвейеры
 
-Сервис состоит из пяти процессов: `api`, `relay` и единственный `consumer` работают постоянно, `migrate` — одноразовый, плюс инфраструктурные PostgreSQL и RabbitMQ. Отдельного активного webhook-worker в Compose нет.
+Сервис состоит из шести контейнеров: `api`, `relay` и единственный `consumer` работают постоянно, `migrate` — одноразовый, плюс инфраструктурные PostgreSQL и RabbitMQ. Отдельного webhook-worker нет.
 
 | Процесс | Роль | Точка входа |
 |---|---|---|
@@ -107,7 +107,7 @@ Consumer регистрирует только подписку `payments.new`. 
 - `messaging/topology.py` — объявления основной очереди, двух лестниц retry (`retry.N` и `infra.retry.N`) и DLQ; бюджет отказов у лестниц общий.
 - `messaging/routing.py` — выбор маршрута при неудачной обработке и номер попытки.
 - `messaging/redelivery.py` — публикация копии в retry/DLQ и только затем `ack`; при сбое публикации — `nack requeue`.
-- `messaging/schemas.py` — структура транспортных сообщений (`PaymentCreatedMessage`, `WebhookDeliveryMessage`).
+- `messaging/schemas.py` — структура транспортного сообщения (`PaymentCreatedMessage`); отдельного конверта webhook-очереди нет.
 - `messaging/connection.py` — подключение к брокеру с повторами.
 - `gateway/fake_gateway.py` — тестовая эмуляция внешнего платёжного шлюза, реализация `PaymentGateway`.
 - `webhook/http_sender.py` — HTTP-отправка webhook, реализация `WebhookSender`.
@@ -131,6 +131,7 @@ Consumer регистрирует только подписку `payments.new`. 
 - `config.py` — настройки окружения и проверка их совместимости (см. ниже).
 - `migrations/versions/20261118_0001_initial.py` — `payments` и `outbox`.
 - `migrations/versions/20261119_0002_webhook_deliveries.py` — `webhook_deliveries` и индекс `ix_outbox_event_type`.
+- `migrations/versions/20261120_0003_outbox_dispatch.py` — колонка `outbox.dispatch` и частичный индекс `ix_outbox_relay_pending`.
 - `docker-compose.yml` — postgres, rabbitmq (с volume), migrate, api, relay и один consumer.
 
 ## Состояние: что и где хранится
@@ -160,7 +161,7 @@ Consumer регистрирует только подписку `payments.new`. 
 | Тайминги клеймов и ретраев согласованы | `Settings`-валидаторы в `config.py` |
 | Схема миграций совпадает с `metadata` | `tests/unit/test_migration_schema_parity.py` |
 
-Числовые значения (TTL 35/70 с, бюджеты клеймов) и их обоснование — в [`README.md`](../README.md#надёжность).
+Числовые значения (TTL retry-очередей 1 и 2 с, infra-лестница 2 и 4 с, клейм 30 с, бюджет ожидания дубликата 48 с) и их обоснование — в [`README.md`](../README.md#надёжность).
 
 ## Текущий runtime и границы документации
 

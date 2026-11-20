@@ -26,8 +26,8 @@ payments_table = Table(
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("amount", Numeric(19, 4), nullable=False),
     Column("currency", String(3), nullable=False),
-    Column("description", Text, nullable=False, default=""),
-    Column("metadata", JSONB, nullable=False, default=dict),
+    Column("description", Text, nullable=False, default="", server_default=""),
+    Column("metadata", JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")),
     Column("status", String(16), nullable=False),
     Column("fingerprint", String(64), nullable=True),
     Column("idempotency_key", String(255), nullable=False, unique=True),
@@ -46,13 +46,13 @@ outbox_table = Table(
     Column("event_type", String(64), nullable=False),
     Column("payload", JSONB, nullable=False),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
-    Column("sent", Boolean, nullable=False, default=False),
+    Column("sent", Boolean, nullable=False, default=False, server_default=text("false")),
     Column("sent_at", TIMESTAMP(timezone=True), nullable=True),
     # 'relay' — публикует relay; 'local' — запись хранится для consumer'а и не
     # подлежит публикации (см. migrations/versions/20261120_0003_outbox_dispatch.py)
-    Column("dispatch", String(16), nullable=False, default="relay"),
-    Column("failed", Boolean, nullable=False, default=False),
-    Column("attempts", Integer, nullable=False, default=0),
+    Column("dispatch", String(16), nullable=False, default="relay", server_default=text("'relay'")),
+    Column("failed", Boolean, nullable=False, default=False, server_default=text("false")),
+    Column("attempts", Integer, nullable=False, default=0, server_default=text("0")),
 )
 
 # Задача доставки webhook: один ряд на событие (стабильный event_id из outbox).
@@ -62,8 +62,10 @@ webhook_deliveries_table = Table(
     metadata,
     Column("event_id", String(64), primary_key=True),
     Column("payment_id", UUID(as_uuid=True), nullable=False),
-    Column("status", String(16), nullable=False, default="pending"),
-    Column("attempts", Integer, nullable=False, default=0),
+    Column(
+        "status", String(16), nullable=False, default="pending", server_default=text("'pending'")
+    ),
+    Column("attempts", Integer, nullable=False, default=0, server_default=text("0")),
     Column("last_error", Text, nullable=True),
     Column("locked_until", TIMESTAMP(timezone=True), nullable=True),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),

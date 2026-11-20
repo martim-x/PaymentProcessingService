@@ -10,6 +10,7 @@
 
 import json
 import logging
+from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -18,9 +19,15 @@ from sqlalchemy.exc import OperationalError
 
 from payment.adapters.messaging.routing import ATTEMPT_HEADER, INFRA_ATTEMPT_HEADER
 from payment.adapters.messaging.topology import declare_topology, infra_retry_queue_name
-from payment.application.dto import ProcessPaymentResult, WebhookDeliveryCommand
-from payment.application.exceptions import PaymentBusy, PaymentNotFound
+from payment.application.dto import (
+    CreatePaymentCommand,
+    ProcessPaymentResult,
+    WebhookDeliveryCommand,
+)
+from payment.application.exceptions import PaymentBusy, PaymentNotFound, WebhookDeliveryExhausted
 from payment.config import Settings
+from payment.domain.model.enums import Currency
+from payment.domain.model.value_objects import IdempotencyKey
 from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
 from payment.entrypoints.consumer.app import handle_payment_created
 
@@ -92,12 +99,15 @@ class StubPaymentService:
 
 
 class FakeWebhookService:
-    def __init__(self, result=None) -> None:
+    def __init__(self, result=None, exc: BaseException | None = None) -> None:
         self.commands: list[WebhookDeliveryCommand] = []
         self.result = result
+        self.exc = exc
 
     async def deliver(self, command: WebhookDeliveryCommand) -> object:
         self.commands.append(command)
+        if self.exc is not None:
+            raise self.exc
         return self.result
 
     async def enqueue(self, command: WebhookDeliveryCommand) -> None:
@@ -106,7 +116,12 @@ class FakeWebhookService:
 
 class FakeContainer:
     def __init__(
-        self, cfg: Settings, payment_service: StubPaymentService, *, stale: bool = False
+        self,
+        cfg: Settings,
+        payment_service: StubPaymentService,
+        *,
+        stale: bool = False,
+        webhook_exc: BaseException | None = None,
     ) -> None:
         self.settings = cfg
         self.retry_policy = ExponentialBackoffRetryPolicy(
@@ -115,7 +130,7 @@ class FakeContainer:
             factor=cfg.retry_factor,
         )
         self._payment_service = payment_service
-        self._webhook_service = FakeWebhookService(SimpleNamespace(stale=stale))
+        self._webhook_service = FakeWebhookService(SimpleNamespace(stale=stale), exc=webhook_exc)
 
     def payment_service(self) -> StubPaymentService:
         return self._payment_service
@@ -271,6 +286,112 @@ class TestInfraRouting:
         assert len(container.webhook_service().commands) == 1
         assert container.webhook_service().commands[0].payment_id == PAYMENT_ID
 
+    async def test_exhausted_webhook_goes_straight_to_dlq(self) -> None:
+        """Исчерпанный бюджет доставки не тратит попытки брокера."""
+        container = FakeContainer(
+            settings(),
+            StubPaymentService(),
+            webhook_exc=WebhookDeliveryExhausted("evt-success", 3, "endpoint is down"),
+        )
+
+        message, broker = await consume(container)
+
+        assert message.acked is True
+        assert broker.last["queue"] == DLQ
+        assert broker.last["headers"] is None
+
+
+class TestFailureChain:
+    async def test_alternating_failures_share_one_budget(self) -> None:
+        """business → infra → business: счётчики переносятся, третий отказ — DLQ."""
+        from payment.adapters.messaging.redelivery import publish_failure
+        from payment.adapters.messaging.routing import route_failure, route_infra_failure
+
+        policy = ExponentialBackoffRetryPolicy(max_attempts=3, base_delay=1.0)
+        headers: dict = {}
+        actions: list[str] = []
+
+        for route in (route_failure, route_infra_failure, route_failure):
+            message = FakeMessage(json.dumps(body()).encode(), headers=headers)
+            broker = FakeBroker()
+            decision = route(headers, policy, queue_name=QUEUE, dlq_name=DLQ)
+            await publish_failure(broker, message, body(), decision)  # type: ignore[arg-type]
+            actions.append(decision.action)
+            if decision.action == "dlq":
+                assert broker.last["queue"] == DLQ
+                assert broker.last["headers"] is None
+                break
+            headers = broker.last["headers"]
+
+        assert actions == ["retry", "retry", "dlq"]
+
+
+class TestConsumerRedelivery:
+    """Consumer-уровень: повтор сообщения после финализации не ходит в шлюз."""
+
+    async def test_redelivery_after_webhook_failure_skips_the_gateway(self) -> None:
+        from payment.application.services.payment_service import PaymentService
+        from payment.application.services.webhook_service import WebhookService
+        from tests.fakes import FakeGateway, FakeUnitOfWork, FakeWebhookSender
+
+        uow = FakeUnitOfWork()
+        gateway = FakeGateway(succeed=True)
+        sender = FakeWebhookSender(fail_first=1)
+
+        class RealContainer:
+            def __init__(self) -> None:
+                self.settings = settings()
+                self.retry_policy = ExponentialBackoffRetryPolicy(
+                    max_attempts=self.settings.max_attempts,
+                    base_delay=self.settings.retry_base_delay,
+                    factor=self.settings.retry_factor,
+                )
+
+            def payment_service(self) -> PaymentService:
+                return PaymentService(uow=uow, gateway=gateway)
+
+            def webhook_service(self) -> WebhookService:
+                return WebhookService(
+                    uow=uow, sender=sender, max_attempts=self.settings.max_attempts
+                )
+
+        container = RealContainer()
+        created = await container.payment_service().create_payment(
+            CreatePaymentCommand(
+                amount=Decimal("10.00"),
+                currency=Currency.RUB,
+                description="redelivery",
+                metadata={},
+                idempotency_key=IdempotencyKey("redelivery-key"),
+                webhook_url="https://example.com/hook",
+            )
+        )
+        payment_id = str(created.payment.id)
+        first = FakeMessage(
+            json.dumps({"event": "payment.created", "payment_id": payment_id}).encode()
+        )
+        broker = FakeBroker()
+        await handle_payment_created(first, broker=broker, container=container)  # type: ignore[arg-type]
+
+        assert first.acked is True
+        assert broker.last["queue"] == f"{QUEUE}.retry.1"
+        assert gateway.calls == 1
+        assert sender.calls == 1  # первая HTTP-попытка упала
+
+        second = FakeMessage(
+            json.dumps({"event": "payment.created", "payment_id": payment_id}).encode(),
+            headers=broker.last["headers"],
+        )
+        retry_broker = FakeBroker()
+        await handle_payment_created(second, broker=retry_broker, container=container)  # type: ignore[arg-type]
+
+        assert second.acked is True
+        assert retry_broker.published == []  # повтор не породил новое сообщение
+        assert gateway.calls == 1  # шлюз не вызывался второй раз
+        assert sender.calls == 2
+        assert len(sender.sent) == 1
+        assert sender.sent[0]["payload"]["id"] == payment_id
+
 
 class TestTopologyDeclaration:
     class RecordingBroker:
@@ -384,6 +505,20 @@ class TestRoutingPolicyUnit:
         assert decision.action == "retry"
         assert decision.header == INFRA_ATTEMPT_HEADER
         assert decision.header_value == header_value + 1
+
+    def test_busy_clamps_to_the_last_retry_queue(self) -> None:
+        """Занятое сообщение откладывается по последней ступени и не тратит бюджет."""
+        from payment.adapters.messaging.routing import route_busy
+
+        decision = route_busy(
+            {ATTEMPT_HEADER: 9},
+            ExponentialBackoffRetryPolicy(max_attempts=3, base_delay=1.0),
+            queue_name=QUEUE,
+        )
+
+        assert decision.action == "retry"
+        assert decision.queue == f"{QUEUE}.retry.2"
+        assert decision.header_value == 9
 
     def test_total_failures_reach_dlq_at_the_shared_limit(self) -> None:
         from payment.adapters.messaging.routing import route_infra_failure
