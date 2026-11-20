@@ -21,8 +21,9 @@ class FakeBroker:
     def __init__(self) -> None:
         self.published: list[tuple[object, str]] = []
 
-    async def publish(self, payload: object, *, queue: str) -> None:
+    async def publish(self, payload: object, *, queue: str, **kwargs: object) -> bool:
         self.published.append((payload, queue))
+        return True
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,8 @@
 
 import asyncio
 import ipaddress
+import socket
+from typing import Any
 from urllib.parse import urlsplit
 
 
@@ -10,14 +12,8 @@ class UnsafeWebhookUrl(ValueError):
 
 
 def _is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+    # is_global отвергает CGNAT; multicast требуется исключить отдельно.
+    return ip.is_global and not ip.is_multicast
 
 
 def validate_public_http_url(url: str) -> None:
@@ -51,10 +47,8 @@ def validate_public_http_url(url: str) -> None:
             raise UnsafeWebhookUrl(f"private address {address} for host {host!r}")
 
 
-def socket_getaddrinfo(host: str, port: int):
+def socket_getaddrinfo(host: str, port: int) -> list[tuple[Any, ...]]:
     """Синхронный резолв через socket (вызывать через asyncio.to_thread)."""
-    import socket
-
     return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
 
 

@@ -1,4 +1,4 @@
-"""Формат сообщения в брокере (Pydantic-схема payload)."""
+"""Формат сообщений в брокере (Pydantic-схемы payload)."""
 
 from pydantic import BaseModel, Field
 

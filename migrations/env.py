@@ -16,7 +16,9 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # URL берём из окружения (PAYMENT_DATABASE_URL), а не из alembic.ini
-database_url = os.environ.get("PAYMENT_DATABASE_URL", "postgresql+psycopg://payment:payment@postgres:5432/payments")
+database_url = os.environ.get(
+    "PAYMENT_DATABASE_URL", "postgresql+psycopg://payment:payment@postgres:5432/payments"
+)
 config.set_main_option("sqlalchemy.url", database_url)
 
 target_metadata = metadata

@@ -8,6 +8,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
+
 _INSECURE_DEFAULTS = {
     "",
     "change-me",
@@ -27,7 +29,7 @@ class Settings(BaseSettings):
     # PostgreSQL
     database_url: str = "postgresql+psycopg://payment:payment@postgres:5432/payments"
 
-    # RabbitMQ
+    # RabbitMQ: один конвейер — обработка платежа и доставка webhook в одном handler
     rabbitmq_url: str = "amqp://guest:guest@rabbitmq:5672/"
     rabbitmq_queue: str = "payments.new"
     rabbitmq_dlq: str = "payments.dlq"
@@ -51,6 +53,9 @@ class Settings(BaseSettings):
     max_attempts: int = 3
     retry_base_delay: float = 1.0
     retry_factor: float = 2.0
+    # Транзиентные сбои БД/транспорта: отдельная лестница задержек (счётчик
+    # x-infra-attempt задаёт её ступень), но общий с max_attempts бюджет отказов.
+    infra_retry_base_delay: float = 2.0
 
     # Клейм обработки платежа: страхует от зависшего consumer'а.
     # TTL покрывает шлюз (process_max) + финализацию с запасом.
@@ -61,9 +66,12 @@ class Settings(BaseSettings):
     claim_poll_seconds: float = 0.5
     # запас на финализацию: TTL клейма обязан быть больше process_max на эту величину
     claim_finalize_margin_seconds: float = 5.0
+    # Клейм доставки webhook: пока он жив, дубликат события не отправит второй запрос.
+    # TTL покрывает HTTP-таймаут webhook с запасом.
+    webhook_claim_ttl_seconds: float = 30.0
     # Сколько раз relay пытается опубликовать «ядовитую» запись outbox
     outbox_max_attempts: int = 10
-    # Prefetch consumer'а: сколько сообщений он берёт из очереди одновременно
+    # Prefetch consumer'ов: сколько сообщений канал берёт из очереди одновременно
     consumer_prefetch: int = 10
 
     @property
@@ -80,6 +88,70 @@ class Settings(BaseSettings):
             self.retry_base_delay * (self.retry_factor**i) for i in range(self.max_attempts - 1)
         )
         return waits + delays
+
+    @property
+    def infra_retry_policy(self) -> ExponentialBackoffRetryPolicy:
+        """Политика ретраев транзиентных инфраструктурных сбоев.
+
+        Отличается от политики конвейера только базой задержки: граница попыток
+        общая, иначе суммарное число отказов перестало бы равняться max_attempts.
+        """
+        return ExponentialBackoffRetryPolicy(
+            max_attempts=self.max_attempts,
+            base_delay=self.infra_retry_base_delay,
+            factor=self.retry_factor,
+        )
+
+    @model_validator(mode="after")
+    def _check_numeric_limits(self) -> "Settings":
+        """Запрещает значения, превращающие retry-цепочки в горячий цикл.
+
+        Определён до проверок бюджета: иначе отрицательная база задержки
+        «съест» бюджет и отчёт будет про claim TTL, а не про виновника.
+        """
+        if self.max_attempts < 2:
+            raise ValueError(
+                "PAYMENT_MAX_ATTEMPTS "
+                f"({self.max_attempts}) must be at least 2: with a single attempt a "
+                "transient failure goes straight to the DLQ and the payment stays pending"
+            )
+        if self.retry_base_delay <= 0:
+            raise ValueError(
+                "PAYMENT_RETRY_BASE_DELAY "
+                f"({self.retry_base_delay}) must be > 0: a zero-TTL retry queue "
+                "redelivers the message immediately, which is a hot requeue loop"
+            )
+        if self.retry_factor < 1:
+            raise ValueError(
+                "PAYMENT_RETRY_FACTOR "
+                f"({self.retry_factor}) must be >= 1.0: a shrinking delay turns "
+                "exponential backoff into a busy retry loop"
+            )
+        if self.infra_retry_base_delay <= 0:
+            raise ValueError(
+                "PAYMENT_INFRA_RETRY_BASE_DELAY "
+                f"({self.infra_retry_base_delay}) must be > 0: a zero-TTL infra retry "
+                "queue redelivers the message immediately"
+            )
+        if self.consumer_prefetch < 1:
+            raise ValueError(
+                "PAYMENT_CONSUMER_PREFETCH "
+                f"({self.consumer_prefetch}) must be >= 1: 0 means unlimited prefetch "
+                "in aio-pika, so a backlog would starve the webhook consumer"
+            )
+        if self.claim_poll_seconds <= 0:
+            raise ValueError(
+                "PAYMENT_CLAIM_POLL_SECONDS "
+                f"({self.claim_poll_seconds}) must be > 0: polling the claim in a "
+                "tight loop burns CPU instead of waiting for the lease to expire"
+            )
+        if self.claim_wait_seconds <= 0:
+            raise ValueError(
+                "PAYMENT_CLAIM_WAIT_SECONDS "
+                f"({self.claim_wait_seconds}) must be > 0: a duplicate must give the "
+                "running consumer a chance to finish before it spends a retry attempt"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_claim_lower_bound(self) -> "Settings":
@@ -109,6 +181,19 @@ class Settings(BaseSettings):
                 "stay pending. The budget must exceed the TTL by at least two poll "
                 "intervals: increase PAYMENT_CLAIM_WAIT_SECONDS or lower "
                 "PAYMENT_CLAIM_TTL_SECONDS."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_webhook_claim_ttl(self) -> "Settings":
+        minimum = self.webhook_timeout + self.claim_finalize_margin_seconds
+        if self.webhook_claim_ttl_seconds < minimum:
+            raise ValueError(
+                "PAYMENT_WEBHOOK_CLAIM_TTL_SECONDS "
+                f"({self.webhook_claim_ttl_seconds}) must be at least "
+                "PAYMENT_WEBHOOK_TIMEOUT + PAYMENT_CLAIM_FINALIZE_MARGIN_SECONDS "
+                f"({minimum}s): a shorter claim lets a duplicate delivery start while "
+                "the first HTTP request is still in flight."
             )
         return self
 

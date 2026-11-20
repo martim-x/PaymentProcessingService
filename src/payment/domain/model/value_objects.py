@@ -1,4 +1,9 @@
-"""Значимые объекты (Value Objects) домена."""
+"""Значимые объекты (Value Objects) домена: неизменяемые, валидируются при создании.
+
+Денежные и URL-инварианты нарушаются доменными исключениями (InvalidMoney,
+InvalidWebhookUrl) — HTTP-слой отдаёт по ним 422. IdempotencyKey остаётся
+на уровне ValueError: это ошибка входа, а не бизнес-правило.
+"""
 
 import ipaddress
 import uuid
@@ -17,6 +22,13 @@ _MONEY_MAX = Decimal("999999999999999.9999")
 
 @dataclass(frozen=True, slots=True)
 class Money:
+    """Сумма с валютой, приведённая к точности БД.
+
+    Квантование до 4 знаков (ROUND_HALF_UP) идёт в конструкторе, поэтому
+    сохранение и сравнение работают уже с нормализованным значением.
+    Нулевые, отрицательные и не-конечные суммы (NaN/Infinity) отсекаются.
+    """
+
     amount: Decimal
     currency: Currency
 
@@ -47,6 +59,7 @@ class PaymentId:
 
     @staticmethod
     def from_string(raw: str) -> "PaymentId":
+        """ValueError, если строка не UUID: API трактует это как 404, а не 500."""
         return PaymentId(value=uuid.UUID(raw))
 
     def __str__(self) -> str:
@@ -55,6 +68,12 @@ class PaymentId:
 
 @dataclass(frozen=True, slots=True)
 class IdempotencyKey:
+    """Ключ клиента для защиты от дублей: непустой, до 255 символов.
+
+    Значение не нормализуется: ключ сравнивается ровно так, как пришёл,
+    поэтому регистр и пробелы по краям значимы.
+    """
+
     value: str
 
     def __post_init__(self) -> None:
@@ -67,6 +86,12 @@ class IdempotencyKey:
 
 @dataclass(frozen=True, slots=True)
 class WebhookUrl:
+    """Адрес уведомления: только http(s) с непустым хостом.
+
+    Литеральный приватный или loopback-IP отклоняется сразу, без DNS;
+    имена, резолвящиеся внутрь сети, проверяет адаптер перед отправкой.
+    """
+
     value: str
 
     def __post_init__(self) -> None:
@@ -85,18 +110,16 @@ class WebhookUrl:
 
 
 def _ip_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return not (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_multicast
-        or address.is_unspecified
-    )
+    # Multicast может иметь is_global=True, поэтому проверяется отдельно.
+    return address.is_global and not address.is_multicast
 
 
 def to_decimal(raw: Any) -> Decimal:
-    """Преобразует сырой ввод API (str/int/float) в Decimal."""
+    """Приводит ввод API (str/int/float) к Decimal; мусор — InvalidMoney.
+
+    Через str(): Decimal(float) сохранил бы двоичное представление
+    (0.1 -> 0.1000...055), а не десятичное 0.1.
+    """
     try:
         return Decimal(str(raw))
     except (InvalidOperation, TypeError, ValueError) as exc:

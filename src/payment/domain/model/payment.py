@@ -14,10 +14,18 @@ _DomainEvent = Union[PaymentCreated, PaymentSucceeded, PaymentFailed]
 
 @dataclass(slots=True)
 class Payment:
+    """Корень агрегата: владеет статусом и переходами pending -> succeeded|failed.
+
+    Dataclass не frozen, поэтому изоляция полей — соглашение, а не гарантия
+    языка: снаружи статус меняют через методы агрегата (они проверяют переход
+    и пишут событие), прямое присваивание допустимо только при маппинге из БД.
+    Доменные события копятся до collect_events.
+    """
+
     id: PaymentId
     amount: Money
     description: str
-    metadata: dict
+    metadata: dict[str, Any]
     idempotency_key: IdempotencyKey
     webhook_url: WebhookUrl
     status: PaymentStatus = PaymentStatus.PENDING
@@ -36,7 +44,7 @@ class Payment:
         payment_id: PaymentId,
         amount: Money,
         description: str,
-        metadata: dict,
+        metadata: dict[str, Any],
         idempotency_key: IdempotencyKey,
         webhook_url: WebhookUrl,
         fingerprint: Optional[str] = None,
@@ -64,6 +72,11 @@ class Payment:
         return payment
 
     def mark_succeeded(self, *, processed_at: Optional[datetime] = None) -> None:
+        """pending -> succeeded и событие PaymentSucceeded.
+
+        InvalidStatusTransition, если платёж уже финализирован: повторная
+        обработка не должна переписывать исход.
+        """
         if self.status is not PaymentStatus.PENDING:
             raise InvalidStatusTransition(self.status.value, PaymentStatus.SUCCEEDED.value)
         self.status = PaymentStatus.SUCCEEDED
@@ -73,6 +86,10 @@ class Payment:
         )
 
     def mark_failed(self, *, reason: str, processed_at: Optional[datetime] = None) -> None:
+        """pending -> failed с причиной и событием PaymentFailed.
+
+        InvalidStatusTransition при повторном вызове: исход платежа неизменен.
+        """
         if self.status is not PaymentStatus.PENDING:
             raise InvalidStatusTransition(self.status.value, PaymentStatus.FAILED.value)
         self.status = PaymentStatus.FAILED
@@ -83,15 +100,21 @@ class Payment:
         )
 
     def collect_events(self) -> list[_DomainEvent]:
+        """Отдаёт накопленные события и очищает буфер: повторный вызов вернёт пусто."""
         events, self._events = self._events, []
         return events
 
     @property
     def is_terminal(self) -> bool:
+        """Платёж финализирован (не pending) и повторной обработке не подлежит."""
         return self.status is not PaymentStatus.PENDING
 
     def to_public_dict(self) -> dict[str, Any]:
-        """Плоское представление для API/брокера (без доменных объектов)."""
+        """Плоское представление для API/брокера (без доменных объектов).
+
+        idempotency_key, fingerprint и locked_until не попадают в словарь:
+        это внутреннее состояние, а не данные клиента.
+        """
         return {
             "id": str(self.id),
             "amount": str(self.amount.amount),

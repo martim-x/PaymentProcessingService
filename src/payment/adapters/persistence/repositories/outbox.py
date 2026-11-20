@@ -7,7 +7,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment.adapters.persistence.orm import outbox_table
-from payment.application.ports.repositories import OutboxRecord
+from payment.application.ports.repositories import DISPATCH_RELAY, OutboxRecord
 
 
 def _record_from_row(row) -> OutboxRecord:
@@ -16,6 +16,10 @@ def _record_from_row(row) -> OutboxRecord:
         aggregate_id=row.aggregate_id,
         payload=dict(row._mapping["payload"]),
         sent=row.sent,
+        attempts=row.attempts,
+        failed=row.failed,
+        event_type=row.event_type,
+        dispatch=row.dispatch,
     )
 
 
@@ -23,24 +27,51 @@ class SqlAlchemyOutboxRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def add(self, *, payload: dict, aggregate_id: str) -> OutboxRecord:
+    async def find_event(self, *, aggregate_id: str, event_type: str) -> OutboxRecord | None:
+        result = await self._session.execute(
+            select(outbox_table)
+            .where(
+                outbox_table.c.aggregate_id == aggregate_id, outbox_table.c.event_type == event_type
+            )
+            .order_by(outbox_table.c.created_at, outbox_table.c.id)
+            .limit(1)
+        )
+        row = result.first()
+        return _record_from_row(row) if row is not None else None
+
+    async def add(
+        self, *, payload: dict, aggregate_id: str, dispatch: str = DISPATCH_RELAY
+    ) -> OutboxRecord:
         record_id = uuid.uuid4()
+        event_type = str(payload.get("event", "unknown"))
         await self._session.execute(
             insert(outbox_table).values(
                 id=record_id,
                 aggregate_id=aggregate_id,
-                event_type=payload.get("event", "unknown"),
+                event_type=event_type,
                 payload=dict(payload),
                 created_at=datetime.now(timezone.utc),
                 sent=False,
+                dispatch=dispatch,
             )
         )
-        return OutboxRecord(id=record_id, aggregate_id=aggregate_id, payload=dict(payload))
+        return OutboxRecord(
+            id=record_id,
+            aggregate_id=aggregate_id,
+            payload=dict(payload),
+            event_type=event_type,
+            dispatch=dispatch,
+        )
 
     async def fetch_unsent(self, batch: int = 100) -> list[OutboxRecord]:
+        """Публикуемые записи: `dispatch='local'` relay не видит вообще."""
         result = await self._session.execute(
             select(outbox_table)
-            .where(outbox_table.c.sent.is_(False), outbox_table.c.failed.is_(False))
+            .where(
+                outbox_table.c.sent.is_(False),
+                outbox_table.c.failed.is_(False),
+                outbox_table.c.dispatch == DISPATCH_RELAY,
+            )
             .order_by(outbox_table.c.created_at)
             .limit(batch)
             .with_for_update(skip_locked=True)

@@ -1,4 +1,4 @@
-"""Unit of Work на SQLAlchemy: payments + outbox в одной транзакции."""
+"""Unit of Work на SQLAlchemy: payments + outbox + webhook_deliveries в одной транзакции."""
 
 from types import TracebackType
 from typing import Optional
@@ -7,15 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payment.adapters.persistence.repositories.outbox import SqlAlchemyOutboxRepository
 from payment.adapters.persistence.repositories.payment import SqlAlchemyPaymentRepository
+from payment.adapters.persistence.repositories.webhook import SqlAlchemyWebhookDeliveryRepository
 from payment.application.ports.repositories import (
     AbstractUnitOfWork,
     OutboxRepository,
     PaymentRepository,
+    WebhookDeliveryRepository,
 )
 
 
 class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
-    """Сессия создаётся на входе в контекст; commit фиксирует payments+outbox атомарно."""
+    """Сессия создаётся на входе в контекст; commit фиксирует все таблицы атомарно."""
 
     def __init__(self, sessionmaker: async_sessionmaker) -> None:
         self._sessionmaker = sessionmaker
@@ -37,6 +39,9 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
         assert session is not None
         self.payments: PaymentRepository = SqlAlchemyPaymentRepository(session)
         self.outbox: OutboxRepository = SqlAlchemyOutboxRepository(session)
+        self.webhook_deliveries: WebhookDeliveryRepository = SqlAlchemyWebhookDeliveryRepository(
+            session
+        )
         return self
 
     async def __aexit__(

@@ -1,13 +1,14 @@
-"""Dependencies FastAPI: X-API-Key и сборка use case'ов."""
+"""Dependencies FastAPI: X-API-Key и сборка сервисов на запрос."""
 
 import hmac
 from typing import Annotated
 
 from fastapi import Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 
-from payment.application.use_cases.create_payment import CreatePayment
-from payment.application.use_cases.get_payment import GetPayment
+from payment.application.services.payment_service import PaymentService
 from payment.config import Settings
+from payment.entrypoints.api.schemas import MAX_IDEMPOTENCY_KEY_LENGTH
 
 
 def get_settings(request: Request) -> Settings:
@@ -28,14 +29,41 @@ async def require_api_key(
         )
 
 
-def build_create_payment(request: Request) -> CreatePayment:
-    """Новый use case на каждый запрос: свой UoW и своя сессия."""
-    return request.app.state.container.create_payment()
+def _idempotency_key_error(message: str) -> RequestValidationError:
+    """Ошибка заголовка в формате FastAPI-валидации (422), а не 500 из домена."""
+    return RequestValidationError(
+        [
+            {
+                "type": "value_error",
+                "loc": ("header", "idempotency-key"),
+                "msg": message,
+                "input": None,
+            }
+        ]
+    )
 
 
-def build_get_payment(request: Request) -> GetPayment:
-    """Новый use case на каждый запрос: свой UoW и своя сессия."""
-    return request.app.state.container.get_payment()
+async def require_idempotency_key(
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+) -> str:
+    """Заголовок обязателен, не пуст/не blank и не длиннее VARCHAR(255)."""
+    if not idempotency_key.strip():
+        raise _idempotency_key_error("Idempotency-Key must not be empty or blank")
+    if len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise _idempotency_key_error(
+            f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters"
+        )
+    return idempotency_key
 
 
-__all__ = ["get_settings", "require_api_key", "build_create_payment", "build_get_payment"]
+def build_payment_service(request: Request) -> PaymentService:
+    """Новый сервис на HTTP-запрос; вместе с ним создаётся свой UoW."""
+    return request.app.state.container.payment_service()
+
+
+__all__ = [
+    "get_settings",
+    "require_api_key",
+    "require_idempotency_key",
+    "build_payment_service",
+]

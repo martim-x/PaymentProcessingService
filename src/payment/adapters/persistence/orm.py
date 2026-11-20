@@ -7,12 +7,14 @@ from sqlalchemy import (
     TIMESTAMP,
     Boolean,
     Column,
+    Index,
     Integer,
     MetaData,
     Numeric,
     String,
     Table,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -46,6 +48,39 @@ outbox_table = Table(
     Column("created_at", TIMESTAMP(timezone=True), nullable=False),
     Column("sent", Boolean, nullable=False, default=False),
     Column("sent_at", TIMESTAMP(timezone=True), nullable=True),
+    # 'relay' — публикует relay; 'local' — запись хранится для consumer'а и не
+    # подлежит публикации (см. migrations/versions/20261120_0003_outbox_dispatch.py)
+    Column("dispatch", String(16), nullable=False, default="relay"),
     Column("failed", Boolean, nullable=False, default=False),
     Column("attempts", Integer, nullable=False, default=0),
 )
+
+# Задача доставки webhook: один ряд на событие (стабильный event_id из outbox).
+# locked_until — клейм, чтобы два consumer'а не отправили один webhook параллельно.
+webhook_deliveries_table = Table(
+    "webhook_deliveries",
+    metadata,
+    Column("event_id", String(64), primary_key=True),
+    Column("payment_id", UUID(as_uuid=True), nullable=False),
+    Column("status", String(16), nullable=False, default="pending"),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("last_error", Text, nullable=True),
+    Column("locked_until", TIMESTAMP(timezone=True), nullable=True),
+    Column("created_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("updated_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("delivered_at", TIMESTAMP(timezone=True), nullable=True),
+)
+
+Index("ix_payments_created_at", payments_table.c.created_at)
+Index(
+    "ix_outbox_unsent",
+    outbox_table.c.created_at,
+    postgresql_where=text("sent = false"),
+)
+Index(
+    "ix_outbox_relay_pending",
+    outbox_table.c.created_at,
+    postgresql_where=text("sent = false AND failed = false AND dispatch = 'relay'"),
+)
+Index("ix_outbox_event_type", outbox_table.c.event_type)
+Index("ix_webhook_deliveries_payment_id", webhook_deliveries_table.c.payment_id)

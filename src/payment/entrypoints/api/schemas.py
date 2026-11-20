@@ -1,6 +1,7 @@
 """Pydantic v2-схемы API."""
 
 import json
+import math
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -11,6 +12,41 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 CurrencyLiteral = Literal["RUB", "USD", "EUR"]
 
 MAX_METADATA_BYTES = 8192
+MAX_IDEMPOTENCY_KEY_LENGTH = 255
+_NUL = "\x00"
+
+
+def _reject_nul(value: str, path: str) -> str:
+    if _NUL in value:
+        raise ValueError(f"{path} must not contain NUL (\\u0000) characters")
+    return value
+
+
+def _check_json_value(value: Any, path: str) -> None:
+    """Отклоняет значения, которые PostgreSQL/JSON не примет или исказит.
+
+    NUL-байт в text/jsonb ломает вставку, а NaN/Infinity не являются
+    валидным JSON и роняют сериализацию ответа об ошибке.
+    """
+    if isinstance(value, str):
+        _reject_nul(value, path)
+    elif isinstance(value, bool) or value is None or isinstance(value, int):
+        return
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must be a finite number")
+    elif isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{path} must be a finite number")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            _reject_nul(key, f"{path} key")
+            _check_json_value(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _check_json_value(item, f"{path}[{index}]")
 
 
 class CreatePaymentRequest(BaseModel):
@@ -20,10 +56,17 @@ class CreatePaymentRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     webhook_url: str = Field(max_length=2048, examples=["https://example.com/webhook"])
 
+    @field_validator("description")
+    @classmethod
+    def _description_chars(cls, value: str) -> str:
+        return _reject_nul(value, "description")
+
     @field_validator("metadata")
     @classmethod
     def _metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        _check_json_value(value, "metadata")
+        # allow_nan=False: невалидный JSON не должен попасть в БД/событие
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(encoded) > MAX_METADATA_BYTES:
             raise ValueError(f"metadata must be at most {MAX_METADATA_BYTES} bytes")
         return value

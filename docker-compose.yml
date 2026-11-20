@@ -12,18 +12,20 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U payment -d payments"]
+      test: [ "CMD-SHELL", "pg_isready -U payment -d payments" ]
       interval: 2s
       timeout: 3s
       retries: 20
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
     ports:
       - "5673:5672"
-      - "15673:15672"  # UI: http://localhost:15673
+      - "15673:15672" # UI: http://localhost:15673
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity" ]
       interval: 3s
       timeout: 5s
       retries: 20
@@ -43,12 +45,14 @@ services:
       PAYMENT_SUCCESS_RATE: ${PAYMENT_SUCCESS_RATE:-0.9}
       PAYMENT_WEBHOOK_TIMEOUT: ${PAYMENT_WEBHOOK_TIMEOUT:-5.0}
       PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-local-webhook-secret}
-      # локальный стенд: webhook ходит на host.docker.internal (частный адрес)
-      PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: ${PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS:-true}
+      # Разрешать private targets только явным override для локального E2E.
+      PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: ${PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS:-false}
       PAYMENT_MAX_ATTEMPTS: ${PAYMENT_MAX_ATTEMPTS:-3}
       PAYMENT_RETRY_BASE_DELAY: ${PAYMENT_RETRY_BASE_DELAY:-1.0}
       PAYMENT_RETRY_FACTOR: ${PAYMENT_RETRY_FACTOR:-2.0}
+      PAYMENT_INFRA_RETRY_BASE_DELAY: ${PAYMENT_INFRA_RETRY_BASE_DELAY:-2.0}
       PAYMENT_CLAIM_TTL_SECONDS: ${PAYMENT_CLAIM_TTL_SECONDS:-30.0}
+      PAYMENT_WEBHOOK_CLAIM_TTL_SECONDS: ${PAYMENT_WEBHOOK_CLAIM_TTL_SECONDS:-30.0}
       PAYMENT_CLAIM_WAIT_SECONDS: ${PAYMENT_CLAIM_WAIT_SECONDS:-15.0}
       PAYMENT_CLAIM_POLL_SECONDS: ${PAYMENT_CLAIM_POLL_SECONDS:-0.5}
       PAYMENT_CLAIM_FINALIZE_MARGIN_SECONDS: ${PAYMENT_CLAIM_FINALIZE_MARGIN_SECONDS:-5.0}
@@ -106,3 +110,4 @@ services:
 
 volumes:
   pgdata:
+  rabbitmqdata:

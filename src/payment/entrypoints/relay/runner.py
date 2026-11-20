@@ -32,12 +32,13 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
         container.retry_policy,
         container.settings.rabbitmq_queue,
         container.settings.rabbitmq_dlq,
+        infra_policy=container.settings.infra_retry_policy,
     )
     try:
         while not stop.is_set():
             try:
-                use_case = container.publish_outbox()
-                published = await use_case.execute(batch=batch)
+                outbox_service = container.outbox_service()
+                published = await outbox_service.publish_pending(batch=batch)
                 if published:
                     logger.info("relay published %d events", published)
             except Exception:  # noqa: BLE001 — одна итерация не должна убивать relay

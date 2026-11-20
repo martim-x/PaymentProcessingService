@@ -40,7 +40,9 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install "bandit[toml]"
-      - run: bandit -c pyproject.toml -q src
+      - name: Сканирование src
+        # -r обязателен: без него bandit пишет "Skipping directory (src)" и выходит с кодом 0
+        run: bandit -c pyproject.toml -r -q src
 
   unit:
     name: Unit-тесты (py${{ matrix.python }})
@@ -85,7 +87,9 @@ jobs:
         run: alembic upgrade head
       - name: Тесты
         env:
-          PAYMENT_DATABASE_URL: postgresql+psycopg://payment:payment@localhost:5432/payments
+          # Тесты работают в собственной временной схеме и не используют
+          # PAYMENT_DATABASE_URL как fallback — тестовый DSN задаётся явно
+          PAYMENT_TEST_DATABASE_URL: postgresql+psycopg://payment:payment@localhost:5432/payments
         run: pytest tests/integration -q
 
   e2e:
@@ -99,11 +103,13 @@ jobs:
       - name: Установка зависимостей
         run: pip install -e ".[test]"
       - name: Поднять стек
+        env:
+          PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
         run: docker compose up --build -d
       - name: Дождаться готовности API
         run: |
           for i in $(seq 1 60); do
-            if curl -sf http://localhost:8000/health > /dev/null; then echo "API ready"; exit 0; fi
+            if curl -sf -H "X-API-Key: ${PAYMENT_API_KEY:-local-dev-key}" http://localhost:8000/health > /dev/null; then echo "API ready"; exit 0; fi
             sleep 2
           done
           echo "API did not become ready"; docker compose logs --tail 100; exit 1
@@ -116,6 +122,17 @@ jobs:
         run: ./scripts/chaos_kill9.sh
         env:
           PAYMENT_API_KEY: local-dev-key
+      # Без флага тест пропускается, поэтому DLQ-путь раньше не проверялся в CI.
+      # Management API RabbitMQ опубликован compose'ом на 15673 (guest:guest).
+      - name: "DLQ E2E: три неудачных webhook → payments.dlq"
+        run: pytest tests/e2e/test_failed_webhook_dlq.py -q
+        env:
+          PAYMENT_RUN_DLQ_E2E: "1"
+          PAYMENT_API_URL: http://localhost:8000
+          PAYMENT_API_KEY: local-dev-key
+          PAYMENT_RABBITMQ_MANAGEMENT_URL: http://localhost:15673
+          PAYMENT_RABBITMQ_MANAGEMENT_API_KEY: "guest:guest"
+          PAYMENT_E2E_WEBHOOK_PORT: "9000"
       - name: Логи при падении
         if: failure()
         run: docker compose logs --tail 50
