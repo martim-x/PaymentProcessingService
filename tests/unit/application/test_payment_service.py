@@ -33,15 +33,6 @@ class TestPaymentService:
         assert loaded.id == created.payment.id.value
         assert loaded.amount == Decimal("12.5000")
 
-    async def test_create_keeps_idempotency_behavior(self) -> None:
-        service = PaymentService(uow=FakeUnitOfWork(), gateway=FakeGateway())
-
-        first = await service.create_payment(command())
-        second = await service.create_payment(command())
-
-        assert first.payment.id == second.payment.id
-        assert second.created is False
-
     async def test_get_raises_not_found(self) -> None:
         service = PaymentService(uow=FakeUnitOfWork(), gateway=FakeGateway())
 

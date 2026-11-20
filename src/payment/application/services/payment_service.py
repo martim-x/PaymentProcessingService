@@ -60,7 +60,7 @@ def build_webhook_body(payment: Payment, event_id: str) -> dict[str, Any]:
 
 
 def build_webhook_event(payment: Payment, event_id: str) -> dict[str, Any]:
-    """Создаёт транспортный конверт для отдельного webhook-конвейера."""
+    """Создаёт payload уведомления, доставляемого обработчиком платежа."""
     return {
         "event": WEBHOOK_EVENT,
         "event_id": event_id,

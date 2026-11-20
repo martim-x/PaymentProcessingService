@@ -8,18 +8,17 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
+import pytest
 
 API_URL = os.environ.get("PAYMENT_API_URL", "http://localhost:8000")
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("PAYMENT_RUN_DLQ_E2E") != "1",
+    reason="set PAYMENT_RUN_DLQ_E2E=1 to run the isolated DLQ E2E test",
+)
+
 
 def test_three_failed_webhooks_are_dead_lettered_with_stable_event_id() -> None:
-    if os.environ.get("PAYMENT_RUN_DLQ_E2E") != "1":
-        import pytest
-
-        pytest.skip("set PAYMENT_RUN_DLQ_E2E=1 to run the isolated DLQ E2E test")
-
-    import pytest
-
     api_key = os.environ.get("PAYMENT_API_KEY")
     management_url = os.environ.get("PAYMENT_RABBITMQ_MANAGEMENT_URL")
     management_api_key = os.environ.get("PAYMENT_RABBITMQ_MANAGEMENT_API_KEY")

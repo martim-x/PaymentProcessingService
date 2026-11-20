@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # PostgreSQL
     database_url: str = "postgresql+psycopg://payment:payment@postgres:5432/payments"
 
-    # RabbitMQ: один конвейер — обработка платежа и доставка webhook в одном handler
+    # RabbitMQ: consumer последовательно обрабатывает платёж и доставляет webhook
     rabbitmq_url: str = "amqp://guest:guest@rabbitmq:5672/"
     rabbitmq_queue: str = "payments.new"
     rabbitmq_dlq: str = "payments.dlq"
