@@ -2,7 +2,8 @@ name: payment-service
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:19.0-alpine
+
     environment:
       POSTGRES_USER: payment
       POSTGRES_PASSWORD: payment
@@ -10,7 +11,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata19:/var/lib/postgresql
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U payment -d payments" ]
       interval: 2s
@@ -18,9 +19,10 @@ services:
       retries: 20
 
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:4.4.1-management-alpine
+
     volumes:
-      - rabbitmqdata:/var/lib/rabbitmq
+      - rabbitmqdata44:/var/lib/rabbitmq
     ports:
       - "5673:5672"
       - "15673:15672" # UI: http://localhost:15673
@@ -32,6 +34,7 @@ services:
 
   migrate:
     build: .
+
     environment: &service_env
       PAYMENT_DATABASE_URL: ${PAYMENT_DATABASE_URL:-postgresql+psycopg://payment:payment@postgres:5432/payments}
       PAYMENT_RABBITMQ_URL: ${PAYMENT_RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
@@ -65,6 +68,7 @@ services:
 
   api:
     build: .
+
     environment:
       <<: *service_env
     command: uvicorn payment.entrypoints.api.app:app --host 0.0.0.0 --port 8000
@@ -80,6 +84,7 @@ services:
 
   relay:
     build: .
+
     environment:
       <<: *service_env
     command: python -m payment.entrypoints.relay.runner
@@ -94,6 +99,7 @@ services:
 
   consumer:
     build: .
+
     environment:
       <<: *service_env
     command: python -m payment.entrypoints.consumer.app
@@ -109,5 +115,5 @@ services:
         condition: service_healthy
 
 volumes:
-  pgdata:
-  rabbitmqdata:
+  pgdata19:
+  rabbitmqdata44:
