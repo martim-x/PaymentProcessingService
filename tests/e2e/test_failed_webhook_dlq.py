@@ -82,7 +82,10 @@ def test_three_failed_webhooks_are_dead_lettered_with_stable_event_id() -> None:
                 )
                 payment_response.raise_for_status()
                 payment = payment_response.json()
-                if len(calls) >= 3:
+                # порт 9000 общий: рядом могут ретраиться уведомления других
+                # сценариев, поэтому считаем только вызовы своего платежа
+                own_calls = [entry for entry in calls if entry.get("id") == payment_id]
+                if len(own_calls) >= 3:
                     fetched = client.post(
                         f"{management_url.rstrip('/')}/api/queues/%2F/payments.dlq/get",
                         auth=(management_credentials[0], management_credentials[1]),
@@ -113,13 +116,15 @@ def test_three_failed_webhooks_are_dead_lettered_with_stable_event_id() -> None:
                             break
                 time.sleep(0.25)
 
-            assert len(calls) == 3, (
-                f"expected 3 failed webhook requests, got {len(calls)}. "
+            own_calls = [entry for entry in calls if entry.get("id") == payment_id]
+            assert len(own_calls) == 3, (
+                f"expected 3 failed webhook requests for {payment_id}, got {len(own_calls)} "
+                f"(всего вызовов на общем порту: {len(calls)}). "
                 "Если 0 — проверьте, что consumer работает с "
                 "PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true: иначе SSRF-гард "
                 "отклоняет host.docker.internal и HTTP-запроса не будет вовсе"
             )
-            event_ids = [entry["event_id"] for entry in calls]
+            event_ids = [entry["event_id"] for entry in own_calls]
             assert isinstance(event_ids[0], str) and event_ids[0]
             assert event_ids == [event_ids[0]] * 3, f"event_id changed across retries: {event_ids}"
             assert payment["status"] in {"succeeded", "failed"}, payment
