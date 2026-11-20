@@ -1,4 +1,4 @@
-"""Таблица задач доставки webhook (вариант 2: outbox -> отдельный обработчик).
+"""Таблица задач доставки webhook: состояние и fencing token по event_id.
 
 Revision ID: 0002_webhook_deliveries
 Revises: 0001_initial

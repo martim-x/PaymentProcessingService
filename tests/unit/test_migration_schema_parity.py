@@ -90,6 +90,22 @@ def _normalize_expression(expression) -> str | None:
     return text or None
 
 
+def _normalize_default(column: sa.Column) -> str | None:
+    """server_default колонки в нормализованном виде.
+
+    Сравнивать нужно именно server_default: integration-тесты строят схему из
+    `metadata`, поэтому расхождение с миграцией означает, что тесты проверяют
+    не ту схему, что в проде (так уже было с outbox.dispatch).
+    """
+    default = column.server_default
+    if default is None:
+        return None
+    argument = getattr(default, "arg", default)
+    text = str(argument) if not isinstance(argument, str) else argument
+    normalized = " ".join(text.lower().split())
+    return normalized or None
+
+
 def _normalize_type(column_type: sa.types.TypeEngine) -> str:
     return str(column_type.compile(dialect=postgresql.dialect())).upper()
 
@@ -186,6 +202,10 @@ class TestTableParity:
                 assert bool(actual.nullable) == bool(expected.nullable), (
                     f"{name}.{column_name}: nullable={actual.nullable} в ORM, "
                     f"{expected.nullable} в миграции"
+                )
+                assert _normalize_default(actual) == _normalize_default(expected), (
+                    f"{name}.{column_name}: DEFAULT {_normalize_default(actual)!r} в ORM, "
+                    f"{_normalize_default(expected)!r} в миграции"
                 )
 
 
