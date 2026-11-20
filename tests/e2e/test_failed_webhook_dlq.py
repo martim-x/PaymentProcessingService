@@ -87,18 +87,38 @@ def test_three_failed_webhooks_are_dead_lettered_with_stable_event_id() -> None:
                         f"{management_url.rstrip('/')}/api/queues/%2F/payments.dlq/get",
                         auth=(management_credentials[0], management_credentials[1]),
                         json={
-                            "count": 1,
+                            "count": 200,
                             "ackmode": "ack_requeue_true",
                             "encoding": "auto",
                             "truncate": 50000,
                         },
                     )
                     if fetched.status_code == 200 and fetched.json():
-                        dlq_message = fetched.json()[0]
-                        break
+                        # В DLQ могут лежать сообщения прошлых прогонов: ищем своё,
+                        # а не первое попавшееся.
+                        for queued in fetched.json():
+                            queued_payload = queued.get("payload")
+                            if isinstance(queued_payload, str):
+                                try:
+                                    queued_payload = json.loads(queued_payload)
+                                except ValueError:
+                                    continue
+                            if (
+                                isinstance(queued_payload, dict)
+                                and queued_payload.get("payment_id") == payment_id
+                            ):
+                                dlq_message = queued
+                                break
+                        if dlq_message is not None:
+                            break
                 time.sleep(0.25)
 
-            assert len(calls) == 3, f"expected 3 failed webhook requests, got {len(calls)}"
+            assert len(calls) == 3, (
+                f"expected 3 failed webhook requests, got {len(calls)}. "
+                "Если 0 — проверьте, что consumer работает с "
+                "PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true: иначе SSRF-гард "
+                "отклоняет host.docker.internal и HTTP-запроса не будет вовсе"
+            )
             event_ids = [entry["event_id"] for entry in calls]
             assert isinstance(event_ids[0], str) and event_ids[0]
             assert event_ids == [event_ids[0]] * 3, f"event_id changed across retries: {event_ids}"

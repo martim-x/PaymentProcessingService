@@ -95,6 +95,12 @@ jobs:
   e2e:
     name: E2E (docker compose)
     runs-on: ubuntu-latest
+    # Флаг нужен не только первому `up`: каждый `docker compose up/start` в job'е
+    # пересоздаёт consumer и подставляет значение заново из окружения. Без него
+    # SSRF-гард отвергает host.docker.internal, и webhook-сценарии получают
+    # «private address 172.17.0.1» вместо HTTP-запроса.
+    env:
+      PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -103,8 +109,6 @@ jobs:
       - name: Установка зависимостей
         run: pip install -e ".[test]"
       - name: Поднять стек
-        env:
-          PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
         run: docker compose up --build -d
       - name: Дождаться готовности API
         run: |
