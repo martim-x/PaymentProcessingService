@@ -34,12 +34,16 @@ class FakePaymentRepository:
         self._by_key: dict[str, Payment] = {}
         # имитация гонки на unique index: add() падает IntegrityError
         self.fail_next_add_with_integrity = False
+        self.add_calls = 0
+        self.idempotency_reads = 0
+        self.race_reads: list[Payment | None] = []
         # имитация платежа, уже обработанного другим consumer'ом
         self.finalized_elsewhere: set[str] = set()
         # имитация активного клейма (другой consumer прямо сейчас обрабатывает)
         self.claimed: set[str] = set()
 
     async def add(self, payment: Payment) -> None:
+        self.add_calls += 1
         if self.fail_next_add_with_integrity:
             from payment.application.exceptions import IdempotencyViolation
 
@@ -78,6 +82,12 @@ class FakePaymentRepository:
         return copy.deepcopy(stored) if stored is not None else None
 
     async def get_by_idempotency_key(self, key: str) -> Payment | None:
+        self.idempotency_reads += 1
+        if self.race_reads:
+            payment = self.race_reads.pop(0)
+            if payment is None:
+                return None
+            return copy.deepcopy(payment)
         stored = self._by_key.get(key)
         return copy.deepcopy(stored) if stored is not None else None
 

@@ -94,22 +94,29 @@ class TestCreatePayment:
         payment_service = service(uow)
         winner = await payment_service.create_payment(command())
 
-        # имитируем гонку: INSERT проигравшего падает на unique-индексе
+        # Первый SELECT не видит конкурирующую незакоммиченную строку.
+        uow.payments.race_reads = [None, winner.payment]
         uow.payments.fail_next_add_with_integrity = True
         loser = await payment_service.create_payment(command())
 
         assert loser.created is False
         assert loser.payment.id.value == winner.payment.id.value
+        assert uow.payments.add_calls == 2  # winner + race loser attempted INSERT
+        assert uow.payments.idempotency_reads == 3  # seed + initial miss + reread
 
     async def test_integrity_error_race_with_different_body_is_conflict(self) -> None:
         uow = FakeUnitOfWork()
         payment_service = service(uow)
-        await payment_service.create_payment(command())
+        winner = await payment_service.create_payment(command())
 
+        # При первом чтении конкурирующий платёж ещё не виден; после INSERT-конфликта виден.
+        uow.payments.race_reads = [None, winner.payment]
         uow.payments.fail_next_add_with_integrity = True
         # другой body при том же ключе -> другой fingerprint -> 409
         with pytest.raises(IdempotencyConflict):
             await payment_service.create_payment(command(amount=Decimal("999.00")))
+        assert uow.payments.add_calls == 2  # winner + conflicting race INSERT
+        assert uow.payments.idempotency_reads == 3  # seed + initial miss + reread
 
 
 class TestPaymentServiceProcessing:

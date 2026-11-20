@@ -103,27 +103,3 @@ class Payment:
         """Отдаёт накопленные события и очищает буфер: повторный вызов вернёт пусто."""
         events, self._events = self._events, []
         return events
-
-    @property
-    def is_terminal(self) -> bool:
-        """Платёж финализирован (не pending) и повторной обработке не подлежит."""
-        return self.status is not PaymentStatus.PENDING
-
-    def to_public_dict(self) -> dict[str, Any]:
-        """Плоское представление для API/брокера (без доменных объектов).
-
-        idempotency_key, fingerprint и locked_until не попадают в словарь:
-        это внутреннее состояние, а не данные клиента.
-        """
-        return {
-            "id": str(self.id),
-            "amount": str(self.amount.amount),
-            "currency": self.amount.currency.value,
-            "description": self.description,
-            "metadata": self.metadata,
-            "status": self.status.value,
-            "failure_reason": self.failure_reason,
-            "webhook_url": self.webhook_url.value,
-            "created_at": self.created_at.isoformat(),
-            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
-        }

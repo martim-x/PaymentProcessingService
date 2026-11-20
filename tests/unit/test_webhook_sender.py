@@ -2,14 +2,24 @@
 
 import httpx
 
+from payment.adapters.webhook import signer
 from payment.adapters.webhook.http_sender import HttpxWebhookSender
-from payment.adapters.webhook.signer import serialize, sign_body, verify_body
+from payment.adapters.webhook.signer import serialize, verify_body
 
 SECRET = "unit-secret"
 PAYLOAD = {"id": "p1", "status": "succeeded", "amount": "10.0000", "description": "Заказ"}
 
 
 class TestHttpxWebhookSender:
+    def _mock_client(self, monkeypatch, transport: httpx.AsyncBaseTransport) -> None:
+        real_client = httpx.AsyncClient
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
     async def test_body_matches_signature_bytes(self, monkeypatch) -> None:
         captured: dict = {}
 
@@ -19,16 +29,11 @@ class TestHttpxWebhookSender:
             return httpx.Response(200)
 
         transport = httpx.MockTransport(handler)
-        real_client = httpx.AsyncClient
-
-        def client_factory(*args, **kwargs):
-            kwargs["transport"] = transport
-            return real_client(*args, **kwargs)
-
-        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+        self._mock_client(monkeypatch, transport)
 
         body = serialize(PAYLOAD)
-        _, timestamp = sign_body(SECRET, body)
+        timestamp = 1_800_000_000
+        monkeypatch.setattr(signer.time, "time", lambda: timestamp)
         sender = HttpxWebhookSender(secret=SECRET, timeout_seconds=1.0, allow_private_hosts=True)
 
         await sender.send(url="http://example.com/hook", payload=PAYLOAD)
@@ -39,13 +44,7 @@ class TestHttpxWebhookSender:
 
     async def test_non_2xx_raises(self, monkeypatch) -> None:
         transport = httpx.MockTransport(lambda request: httpx.Response(503))
-        real_client = httpx.AsyncClient
-
-        def client_factory(*args, **kwargs):
-            kwargs["transport"] = transport
-            return real_client(*args, **kwargs)
-
-        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+        self._mock_client(monkeypatch, transport)
         sender = HttpxWebhookSender(secret=SECRET, timeout_seconds=1.0, allow_private_hosts=True)
 
         try:
