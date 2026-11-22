@@ -56,6 +56,11 @@ Entrypoints (API / Consumer / Relay)
 - **Инфраструктурные ретраи.** Транзиентный сбой БД/транспорта уходит в отдельную лестницу задержек `payments.new.infra.retry.N` (счётчик `x-infra-attempt`, база `PAYMENT_INFRA_RETRY_BASE_DELAY`): паузы длиннее, чем у обычных ретраев. Бюджет отказов при этом общий — `x-attempt` и `x-infra-attempt` складываются и сравниваются с `PAYMENT_MAX_ATTEMPTS`.
 - **Webhook.** HMAC-SHA256 от `timestamp` и точных байтов тела в `X-Signature` (`t=<unix-ts>,v1=<hex>`); сериализация и подпись живут в одном адаптере, поэтому тело и подпись не могут разъехаться. URL проверяется на SSRF (литеральные приватные IP — ещё на API, `422`).
 
+- **Недоступность брокера**. `PublisherUnavailable` (соединение/канал/нет confirms) **не считается попыткой записи**: батч прерывается, уже опубликованное коммитится, `attempts` не растёт. Иначе рестарт RabbitMQ «сжёг» бы лимит и записи ушли бы в `failed`
+- **Poison-запись outbox**. Ошибка публикации одной записи не роняет батч: у неё растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не блокирует остальные
+- **Poison-сообщение**. Невалидный JSON или `payment_id` сразу уходит в `payments.dlq`, без бесконечного ретрая
+- **Согласованность таймингов**. На старте проверяется `claim_ttl ≥ process_max + margin`, `claim_ttl + 2·poll < retry_wait_budget` (с дефолтами 31 с < 48 с), `webhook_claim_ttl ≥ webhook_timeout + margin`
+
 ## Стек
 
 - **FastAPI** + Pydantic v2, **SQLAlchemy 2.0 async**, **PostgreSQL**
@@ -64,19 +69,17 @@ Entrypoints (API / Consumer / Relay)
 
 ## Быстрый старт
 
+Задайте один раз в текущем Bash ключ API и webhook-секрет. Те же переменные Compose передаст сервисам, а команды ниже используют их напрямую; `.env` не требуется.
+
 ```bash
-cp .env.example .env
-# замените заглушки: PAYMENT_API_KEY и PAYMENT_WEBHOOK_SECRET
-# примеры ниже шлют webhook на host.docker.internal: без флага SSRF-гард его отклонит
-PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true docker compose up --build
+read -rsp 'API key: ' PAYMENT_API_KEY; printf '\n'
+read -rsp 'Webhook secret: ' PAYMENT_WEBHOOK_SECRET; printf '\n'
+export PAYMENT_API_KEY PAYMENT_WEBHOOK_SECRET
+export PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true
+docker compose up --build -d
 ```
 
-**Про `.env.example`.** Значения `PAYMENT_API_KEY=change-this-api-key` и
-`PAYMENT_WEBHOOK_SECRET=change-this-webhook-secret` — это placeholders, а не рабочие
-секреты. Приложение отвергает пустые и известные заглушечные значения и **не стартует**,
-пока вы их не замените. Compose без `.env` подставляет свои локальные значения
-(`local-dev-key` / `local-webhook-secret`) — только для локального стенда, на публичном
-их использовать нельзя.
+Приложение отвергает пустые и известные заглушечные значения. `host.docker.internal` для локального приёмника разрешён только с `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`.
 
 Поднимаются сервисы: `postgres` (5433 → 5432), `rabbitmq` (5673, UI 15673, данные в
 volume `rabbitmqdata44`), одноразовый `migrate` (`alembic upgrade head`), `api`, `relay` и
@@ -97,9 +100,11 @@ volume `rabbitmqdata44`), одноразовый `migrate` (`alembic upgrade hea
 
 ### Создание платежа
 
+Перед POST запустите «Локальный приём webhook» в отдельном терминале.
+
 ```bash
-curl -X POST http://localhost:8000/api/v1/payments \
-  -H "X-API-Key: <ваш PAYMENT_API_KEY>" \
+curl -i -X POST http://localhost:8000/api/v1/payments \
+  -H "X-API-Key: $PAYMENT_API_KEY" \
   -H "Idempotency-Key: order-42" \
   -H "Content-Type: application/json" \
   -d '{
@@ -111,27 +116,15 @@ curl -X POST http://localhost:8000/api/v1/payments \
       }'
 ```
 
-`host.docker.internal` — приватный адрес: без `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`
-SSRF-гард отклонит доставку, и сообщение уйдёт в retry, а затем в `payments.dlq`.
-
-Ответ — `202 Accepted`; для нового платежа добавляется заголовок `Location`:
-
-```json
-{"payment_id": "…", "status": "pending", "created_at": "…"}
-```
-
-Повтор с тем же `Idempotency-Key` и тем же телом вернёт тот же платёж (нового не будет,
-`Location` не выставляется); с другим телом — `409 Conflict`. Пустой/пробельный или
-длиннее 255 символов `Idempotency-Key` — `422`.
-
-### Получение платежа
+Ответ `202 Accepted` содержит `payment_id`, `status`, `created_at`; новый платёж также возвращает `Location`. Получить его можно так:
 
 ```bash
-curl http://localhost:8000/api/v1/payments/<payment_id> -H "X-API-Key: <ваш PAYMENT_API_KEY>"
+read -rp 'payment_id из ответа POST: ' PAYMENT_ID
+curl -H "X-API-Key: $PAYMENT_API_KEY" \
+  "http://localhost:8000/api/v1/payments/$PAYMENT_ID"
 ```
 
-`status` меняется с `pending` на `succeeded`/`failed` после обработки consumer'ом
-(~2–5 сек). В ответе есть `webhook_url`, `failure_reason`, `processed_at`.
+Повтор с тем же ключом и телом возвращает существующий платёж; другое тело с тем же ключом даёт `409`.
 
 ### Webhook
 
@@ -190,7 +183,7 @@ Swagger UI, ReDoc и публичный `/openapi.json` отключены: ТЗ
 Схема осталась доступной — но только под тем же ключом:
 
 ```bash
-curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
+curl -fsS -H "X-API-Key: $PAYMENT_API_KEY" \
   http://localhost:8000/api/v1/openapi.json -o openapi.json
 ```
 
@@ -245,27 +238,9 @@ curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
    Сохраняйте исходный payload и свойства, если они есть; получатель webhook должен
    дедуплицировать уведомления по стабильному `event_id`. Проверьте статус доставки.
 
-## Надёжность
-
-| Механизм | Реализация |
-|---|---|
-| **Outbox pattern** | Событие пишется в таблицу `outbox` в той же транзакции, что и платёж (или финальный статус). Relay (поллинг `sent=false AND failed=false AND dispatch='relay'`, `FOR UPDATE SKIP LOCKED`) публикует и помечает `sent`. Записи маршрутизируются по `event_type`; `message_id` — `event_id` из payload, иначе id записи outbox |
-| **Идемпотентность API** | Уникальный `idempotency_key` + fingerprint канонического тела. `IntegrityError` ловится в репозитории и превращается в `IdempotencyViolation`; повтор → тот же платёж, конфликт → `409` |
-| **Retry обработки платежа** | Ошибка обработки → TTL-очередь `payments.new.retry.N`; транзиентный сбой инфраструктуры → `payments.new.infra.retry.N` с более длинными паузами. `x-attempt` и `x-infra-attempt` складываются в общий бюджет: третья неудача любого типа отправляет сообщение в `payments.dlq`. `PaymentBusy`/`WebhookBusy` бюджет не расходуют |
-| **Webhook/outbox** | При финализации сохраняется payload `payment.webhook` с `dispatch='local'`: relay такие строки не выбирает, `sent` не выставляется. Активный обработчик `payments.new` вызывает доставку, её статус хранится в `webhook_deliveries`, а сохранённый payload позволяет возобновить доставку после падения процесса |
-| **DLQ** | `payments.dlq`, durable, разбирается вручную — процедура в разделе «Ручной разбор DLQ» |
-| **Retry webhook** | Ошибка доставки обрабатывается в рамках сообщения `payments.new`: повтор идёт через retry/DLQ того же конвейера, а состояние фактической доставки и число HTTP-неудач ведёт `webhook_deliveries` |
-| **Клейм платежа** | `PAYMENT_CLAIM_TTL_SECONDS` (30 с) покрывает шлюз (`PAYMENT_PROCESS_MAX_SECONDS`) + финализацию. При ошибке/`SIGTERM` клейм снимается по токену (`asyncio.shield`); при `SIGKILL` истекает по TTL. Дубликат ждёт до `PAYMENT_CLAIM_WAIT_SECONDS` (15 с) |
-| **Согласованность таймингов** | На старте проверяется `claim_ttl ≥ process_max + margin`, `claim_ttl + 2·poll < retry_wait_budget` (с дефолтами 31 с < 48 с), `webhook_claim_ttl ≥ webhook_timeout + margin` |
-| **Недоступность брокера** | `PublisherUnavailable` (соединение/канал/нет confirms) **не считается попыткой записи**: батч прерывается, уже опубликованное коммитится, `attempts` не растёт. Иначе рестарт RabbitMQ «сжёг» бы лимит и записи ушли бы в `failed` |
-| **Poison-запись outbox** | Ошибка публикации одной записи не роняет батч: у неё растёт `attempts`, после `PAYMENT_OUTBOX_MAX_ATTEMPTS` она помечается `failed` и не блокирует остальные |
-| **Poison-сообщение** | Невалидный JSON или `payment_id` сразу уходит в `payments.dlq`, без бесконечного ретрая |
-| **Доставка webhook** | Выполняется `WebhookService.deliver` внутри единственного обработчика `payments.new` до ACK; факт доставки и состояние попыток хранит `webhook_deliveries` |
-
 ## Семантика доставки: at-least-once
 
-Система не обещает exactly-once — ни для очередей, ни для webhook. Гарантия —
-**at-least-once**, а повторные побочные эффекты отсекаются ключами идемпотентности:
+Сообщения и webhook могут повторяться (at-least-once, не exactly-once). Это не обещание успешной HTTP-доставки: после исчерпания попыток сообщение уходит в DLQ. Повторы обрабатываются так:
 
 - API — `Idempotency-Key` + fingerprint тела;
 - шлюз — id платежа передаётся как `idempotency_key` (fake gateway ничего не списывает;
@@ -277,15 +252,6 @@ curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
 записью `delivered` (в том числе `SIGKILL`), если клейм истёк во время отправки и
 событие подхватил другой consumer, либо при ручной переигровке сообщения из DLQ.
 `event_id` при этом не меняется, поэтому повтор распознаётся получателем.
-
-## Соответствие буквальному ТЗ
-
-| Требование | Что сделано | Примечание |
-|---|---|---|
-| Один consumer обрабатывает платёж и webhook | `consumer/app.py` регистрирует единственную подписку на `payments.new`; один handler вызывает `PaymentService`, затем `WebhookService.deliver` до ACK | Второго конвейера нет; статус HTTP-доставки в `webhook_deliveries` |
-| Outbox | Платёж и `payment.created` сохраняются транзакционно; outbox публикует relay | Запись `payment.webhook` хранится с `dispatch='local'` и не публикуется |
-| Retry/DLQ | Предел `PAYMENT_MAX_ATTEMPTS` общий: бюджет = `x-attempt` + `x-infra-attempt`, после третьего отказа — `payments.dlq` | DLQ replay ручной; запись `webhook_deliveries` сама не сбрасывается, поэтому её сбрасывают явно |
-| — | `event_id` генерируется как `uuid4().hex` при финализации платежа | Это стаб: он стабилен для всех попыток доставки одного события, но не выводится из состояния платежа. В реальной системе это был бы id записи outbox или детерминированный бизнес-ключ |
 
 ## Безопасность
 
@@ -342,10 +308,10 @@ curl -s -H "X-API-Key: $PAYMENT_API_KEY" \
 | Инварианты конфигурации и топологии | `pytest tests/unit` | бюджеты клеймов, TTL retry-очередей, prefetch, маршрутизация outbox, fencing, паритет ORM-`metadata` с миграциями |
 
 ```bash
-# нужен поднятый стенд и свободный порт 9000 под приём webhook
+# Выполняйте в том же Bash: тест наследует ключ API и webhook-секрет.
+# Остановите ручной приёмник: тест сам займёт порт 9000.
 PAYMENT_RUN_DLQ_E2E=1 \
 PAYMENT_API_URL=http://localhost:8000 \
-PAYMENT_API_KEY=local-dev-key \
 PAYMENT_RABBITMQ_MANAGEMENT_URL=http://localhost:15673 \
 PAYMENT_RABBITMQ_MANAGEMENT_API_KEY=guest:guest \
 PAYMENT_E2E_WEBHOOK_PORT=9000 \
@@ -359,8 +325,13 @@ compose up`: каждый `up`/`start` пересоздаёт consumer и под
 `scripts/chaos_kill9.sh` поэтому запоминает флаг у работающего consumer'а и
 восстанавливает его при пересоздании.
 
-`scripts/chaos_kill9.sh` выполняется и в CI (job **E2E**), поэтому гарантия
-«платёж не застревает после жёсткого падения» подтверждается автоматически.
+`scripts/chaos_kill9.sh` выполняется и в CI (job **E2E**). Он проверяет конкретный
+сценарий: consumer получает claim, завершается через `SIGKILL` во время эмуляции
+шлюза, затем после истечения claim платёж финализируется, webhook получает `2xx`,
+а DLQ не увеличивается. Это не доказывает восстановление при любом типе сбоя или
+для реального шлюза. Скрипт поднимает локальный webhook sink на порту
+`CHAOS_WEBHOOK_PORT` (по умолчанию `9001`); `COMPOSE_PROJECT_NAME` позволяет выбрать
+Compose-проект явно.
 
 ## Ограничения (осознанные)
 
@@ -376,8 +347,7 @@ compose up`: каждый `up`/`start` пересоздаёт consumer и под
   «publishing» и reclaim-логики.
 - **`webhook_deliveries.attempts` и заголовки очереди расходятся.** Заголовки считают отказы обработки сообщения (включая сбои БД), `webhook_deliveries.attempts` — только зафиксированные неудачи HTTP-доставки. Поэтому событие может попасть в DLQ раньше, чем в `webhook_deliveries` накопится три неудачи: это ожидаемо и разбирается вручную.
 - **Ручной DLQ replay требует сброса записи доставки**: возврат сообщения в очередь сам по себе не снимает `failed` в `webhook_deliveries`, и consumer снова завершит сообщение через DLQ, не отправив HTTP-запрос. Пошаговая процедура — в разделе «Ручной разбор DLQ».
-- **`event_id` — стаб** (см. таблицу отступлений): он не выводится из платежа и не
-  гарантирует «одно событие на платёж» на уровне бизнес-ключа.
+- **`event_id` не бизнес-ключ.** Он генерируется при финализации и сохраняется для повторов уведомления.
 - **Повторные уведомления возможны** (at-least-once): получатель обязан дедуплицировать
   по `event_id`. Гарантии «ровно одно уведомление» нет.
 - **Клейм платежа не защищает от двойного списания при истечении TTL.** Пока клейм
@@ -404,14 +374,14 @@ compose up`: каждый `up`/`start` пересоздаёт consumer и под
 python3.15 -m venv venv
 venv/bin/pip install --require-hashes -r requirements.lock
 venv/bin/pip install --no-deps -e .
-venv/bin/pip install ruff==0.17.5 mypy==2.4.1 'bandit[toml]==1.9.4' pre-commit
+venv/bin/pip install ruff==0.17.5 black==26.5.1 mypy==2.4.1 'bandit[toml]==1.9.4' pre-commit
 ```
 
 ### Гейты качества (те же, что в CI)
 
 ```bash
 venv/bin/ruff check src tests                            # линтер
-venv/bin/ruff format --check src tests
+venv/bin/python -m black --check src tests migrations scripts
 venv/bin/python -m mypy src/payment                      # типы
 venv/bin/python -m bandit -r -c pyproject.toml -q src    # безопасность
 venv/bin/python -m pytest tests/unit -q                  # unit
@@ -422,7 +392,7 @@ venv/bin/python -m pytest tests/e2e -q                   # e2e (нужен жи�
 ### Pre-commit и CI
 
 ```bash
-pre-commit install   # ruff + ruff-format, bandit, mypy, unit-тесты и базовые проверки файлов
+pre-commit install   # ruff, Black, bandit, mypy, unit-тесты и базовые проверки файлов
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) — 6 job'ов:
@@ -458,9 +428,7 @@ PAYMENT_TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5433/paym
   `DROP TABLE` не используются, чужие схемы не удаляются. Схема создаётся из
   SQLAlchemy `metadata`, а её паритет с Alembic-миграциями проверяет отдельный unit-тест.
 
-E2E-тесты требуют запустить отдельный локальный стенд (`PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true docker compose up -d`) и слушают порт 9000 для
-приёма webhook; адрес хоста из контейнера — `host.docker.internal`. Секрет
-`PAYMENT_WEBHOOK_SECRET` в окружении теста должен совпадать с секретом сервиса.
+E2E-тесты запускайте против отдельного стенда из быстрого старта в том же Bash: им нужны экспортированные `PAYMENT_API_KEY` и `PAYMENT_WEBHOOK_SECRET`. Остановите ручной приёмник: тесты сами слушают порт 9000. Адрес хоста из контейнера — `host.docker.internal`.
 
 ## Структура
 

@@ -23,9 +23,13 @@ async def require_api_key(
     provided = (x_api_key or "").encode("utf-8")
     expected = settings.api_key.encode("utf-8")
     # compare_digest — константное время сравнения, без утечки по таймингу
-    if not provided or not hmac.compare_digest(provided, expected):
+    if not provided or not hmac.compare_digest(
+        provided,
+        expected,
+    ):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-API-Key"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key",
         )
 
 
@@ -35,7 +39,10 @@ def _idempotency_key_error(message: str) -> RequestValidationError:
         [
             {
                 "type": "value_error",
-                "loc": ("header", "idempotency-key"),
+                "loc": (
+                    "header",
+                    "idempotency-key",
+                ),
                 "msg": message,
                 "input": None,
             }

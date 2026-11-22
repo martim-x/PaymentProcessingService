@@ -37,7 +37,11 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.include_router(payments_router)
     register_error_handlers(app)
 
-    @app.get("/health", tags=["system"], dependencies=[Depends(require_api_key)])
+    @app.get(
+        "/health",
+        tags=["system"],
+        dependencies=[Depends(require_api_key)],
+    )
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 

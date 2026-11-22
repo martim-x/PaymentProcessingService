@@ -12,17 +12,36 @@ from payment.bootstrap import Container
 logger = logging.getLogger(__name__)
 
 
-async def run_relay(container: Container, *, interval: float = 1.0, batch: int = 100) -> None:
-    """Каждые `interval` сек берёт пакет несент записей outbox и публикует их."""
+async def run_relay(
+    container: Container,
+    *,
+    interval: float = 1.0,
+    batch: int = 100,
+) -> None:
+    """Каждые `interval` секунд берёт пакет неотправленных записей outbox и публикует их."""
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    def _on_signal(sig: signal.Signals, frame: FrameType | None) -> None:
-        logger.info("relay stopping (signal %s)", sig)
+    def _on_signal(
+        sig: signal.Signals,
+        frame: FrameType | None,
+    ) -> None:
+        logger.info(
+            "relay stopping (signal %s)",
+            sig,
+        )
         stop.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _on_signal, sig, None)
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+        loop.add_signal_handler(
+            sig,
+            _on_signal,
+            sig,
+            None,
+        )
 
     broker = container.get_broker()
     await connect_with_retry(broker)
@@ -40,11 +59,17 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
                 outbox_service = container.outbox_service()
                 published = await outbox_service.publish_pending(batch=batch)
                 if published:
-                    logger.info("relay published %d events", published)
+                    logger.info(
+                        "relay published %d events",
+                        published,
+                    )
             except Exception:  # noqa: BLE001 — одна итерация не должна убивать relay
                 logger.exception("relay iteration failed; will retry after interval")
             try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=interval,
+                )
             except TimeoutError:
                 pass
     finally:
@@ -52,7 +77,10 @@ async def run_relay(container: Container, *, interval: float = 1.0, batch: int =
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     container = Container()
     asyncio.run(
         run_relay(

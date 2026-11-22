@@ -3,8 +3,12 @@
 import logging
 from collections.abc import Mapping
 
-from payment.application.ports.message_publisher import MessagePublisher, PublisherUnavailable
-from payment.application.ports.repositories import AbstractUnitOfWork, OutboxRecord
+from payment.application.ports.message_publisher import (
+    MessagePublisher,
+    PublisherUnavailable,
+)
+from payment.application.ports.repositories import OutboxRecord
+from payment.application.ports.unit_of_work import AbstractUnitOfWork
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +34,37 @@ class OutboxService:
         self._subject = subject
         self._max_attempts = max_attempts
 
-    def subject_for(self, record: OutboxRecord) -> str:
+    def subject_for(
+        self,
+        *,
+        record: OutboxRecord,
+    ) -> str:
         """Выбирает очередь по event_type, иначе использует очередь по умолчанию."""
         event_type = record.event_type or str(record.payload.get("event") or "")
-        return self._routes.get(event_type, self._subject)
+        return self._routes.get(
+            event_type,
+            self._subject,
+        )
 
     @staticmethod
-    def message_id_for(record: OutboxRecord) -> str | None:
+    def message_id_for(*, record: OutboxRecord) -> str | None:
         """Возвращает стабильный ID сообщения для дедупликации у получателя."""
         event_id = record.payload.get("event_id")
-        if isinstance(event_id, str) and event_id:
+        if (
+            isinstance(
+                event_id,
+                str,
+            )
+            and event_id
+        ):
             return event_id
         return str(record.id) if record.id is not None else None
 
-    async def publish_pending(self, *, batch: int = 100) -> int:
+    async def publish_pending(
+        self,
+        *,
+        batch: int = 100,
+    ) -> int:
         """Публикует до batch записей; возвращает число подтверждённых публикаций.
 
         PublisherUnavailable пробрасывается: временный сбой брокера не тратит
@@ -56,9 +77,9 @@ class OutboxService:
             for record in records:
                 try:
                     await self._publisher.publish(
-                        subject=self.subject_for(record),
+                        subject=self.subject_for(record=record),
                         payload=record.payload,
-                        message_id=self.message_id_for(record),
+                        message_id=self.message_id_for(record=record),
                     )
                 except PublisherUnavailable:
                     if published or failed:
@@ -70,13 +91,20 @@ class OutboxService:
                     )
                     raise
                 except Exception:  # noqa: BLE001 — poison-запись не блокирует батч
-                    dead = await uow.outbox.mark_attempt_failed(record.id, self._max_attempts)
+                    dead = await uow.outbox.mark_attempt_failed(
+                        record_id=record.id,
+                        max_attempts=self._max_attempts,
+                    )
                     failed += 1
-                    logger.exception("outbox record %s publish failed (dead=%s)", record.id, dead)
+                    logger.exception(
+                        "outbox record %s publish failed (dead=%s)",
+                        record.id,
+                        dead,
+                    )
                 else:
                     # Ошибку БД при mark_sent нельзя классифицировать как отказ publish:
                     # сообщение уже могло попасть в брокер, поэтому пробрасываем её.
-                    await uow.outbox.mark_sent(record.id)
+                    await uow.outbox.mark_sent(record_id=record.id)
                     published += 1
             if published or failed:
                 await uow.commit()

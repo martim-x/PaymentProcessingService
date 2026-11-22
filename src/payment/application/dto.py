@@ -11,16 +11,28 @@ from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import IdempotencyKey
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class WebhookDeliveryCommand:
+    """Данные одного webhook-события для передачи отправителю."""
+
     event_id: str
     payment_id: UUID
     url: str
     body: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class CreatePaymentCommand:
+    """Входные данные сценария создания платежа."""
+
     amount: Decimal
     currency: Currency
     description: str
@@ -29,21 +41,37 @@ class CreatePaymentCommand:
     webhook_url: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class CreatePaymentResult:
+    """Платёж, созданный или найденный по ключу идемпотентности."""
+
     payment: Payment
     created: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class ProcessPaymentResult:
+    """Результат обработки платежа и данные для возможной webhook-доставки."""
+
     payment_id: UUID
     status: str
     failure_reason: Optional[str] = None
     webhook_delivery: WebhookDeliveryCommand | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class PaymentDetails:
     """Плоская проекция платежа для API."""
 
@@ -59,7 +87,7 @@ class PaymentDetails:
     processed_at: Optional[datetime]
 
     @staticmethod
-    def from_payment(payment: Payment) -> "PaymentDetails":
+    def from_payment(*, payment: Payment) -> "PaymentDetails":
         return PaymentDetails(
             id=payment.id.value,
             amount=payment.amount.amount,

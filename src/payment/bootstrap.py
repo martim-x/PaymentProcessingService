@@ -2,14 +2,17 @@
 
 from faststream.rabbit import RabbitBroker
 from faststream.rabbit.schemas import Channel
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payment.adapters.gateway.fake_gateway import FakePaymentGateway
 from payment.adapters.messaging.publisher import FastStreamPublisher
 from payment.adapters.persistence.database import make_engine, make_sessionmaker
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
 from payment.adapters.webhook.http_sender import HttpxWebhookSender
-from payment.application.services.outbox_service import PAYMENT_CREATED_EVENT, OutboxService
+from payment.application.services.outbox_service import (
+    PAYMENT_CREATED_EVENT,
+    OutboxService,
+)
 from payment.application.services.payment_service import PaymentService
 from payment.application.services.webhook_service import WebhookService
 from payment.config import Settings, get_settings
@@ -33,13 +36,20 @@ def make_broker(settings: Settings) -> RabbitBroker:
     `on_return_raises=True` превращает возврат mandatory-сообщения (нет
     очереди) в `DeliveryError`, чтобы outbox не помечал запись отправленной.
     """
-    return RabbitBroker(settings.rabbitmq_url, default_channel=make_channel(settings))
+    return RabbitBroker(
+        settings.rabbitmq_url,
+        default_channel=make_channel(settings),
+    )
 
 
 class Container:
     """Собирает инфраструктуру; сервисы создаются на запрос/сообщение."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self.retry_policy = ExponentialBackoffRetryPolicy(
             max_attempts=self.settings.max_attempts,
@@ -47,7 +57,9 @@ class Container:
             factor=self.settings.retry_factor,
         )
         self.engine = make_engine(self.settings.database_url)
-        self.sessionmaker: async_sessionmaker = make_sessionmaker(self.engine)
+        self.sessionmaker: async_sessionmaker[AsyncSession] = make_sessionmaker(
+            self.engine
+        )
         self.gateway = FakePaymentGateway(
             min_seconds=self.settings.process_min_seconds,
             max_seconds=self.settings.process_max_seconds,
@@ -66,7 +78,7 @@ class Container:
         Экземпляр не переиспользуется между запросами и сообщениями —
         иначе транзакции смешались бы.
         """
-        return SqlAlchemyUnitOfWork(self.sessionmaker)
+        return SqlAlchemyUnitOfWork(sessionmaker=self.sessionmaker)
 
     def payment_service(self) -> PaymentService:
         """Сервис запросов и обработки платежа с отдельным UoW на экземпляр."""
@@ -103,7 +115,7 @@ class Container:
         return self._broker
 
     def get_broker_publisher(self) -> FastStreamPublisher:
-        return FastStreamPublisher(self.get_broker())
+        return FastStreamPublisher(broker=self.get_broker())
 
     async def dispose(self) -> None:
         if self._broker is not None:

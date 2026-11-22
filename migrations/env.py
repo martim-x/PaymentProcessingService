@@ -17,9 +17,13 @@ if config.config_file_name is not None:
 
 # URL берём из окружения (PAYMENT_DATABASE_URL), а не из alembic.ini
 database_url = os.environ.get(
-    "PAYMENT_DATABASE_URL", "postgresql+psycopg://payment:payment@postgres:5432/payments"
+    "PAYMENT_DATABASE_URL",
+    "postgresql+psycopg://payment:payment@postgres:5432/payments",
 )
-config.set_main_option("sqlalchemy.url", database_url)
+config.set_main_option(
+    "sqlalchemy.url",
+    database_url,
+)
 
 target_metadata = metadata
 
@@ -37,14 +41,20 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
 
 async def run_async_migrations() -> None:
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        config.get_section(
+            config.config_ini_section,
+            {},
+        ),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )

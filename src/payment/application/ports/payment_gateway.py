@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class GatewayResult:
     """Итог вызова шлюза: отказ — succeeded=False с причиной, а не исключение."""
 
@@ -13,8 +17,15 @@ class GatewayResult:
 
 
 class PaymentGateway(Protocol):
+    """Контракт обработки платежа внешним шлюзом."""
+
     async def process(
-        self, *, payment_id: str, amount: object, currency: str, idempotency_key: str = ""
+        self,
+        *,
+        payment_id: str,
+        amount: object,
+        currency: str,
+        idempotency_key: str = "",
     ) -> GatewayResult:
         """Проводит списание; бизнес-отказ возвращается как GatewayResult.
 

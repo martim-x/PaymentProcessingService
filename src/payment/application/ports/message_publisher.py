@@ -10,6 +10,13 @@ class PublisherUnavailable(Exception):
     иначе рестарт RabbitMQ на пару секунд «сожжёт» весь лимит попыток.
     """
 
+    def __init__(
+        self,
+        *,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+
 
 class PublishRejected(Exception):
     """Брокер отверг конкретную публикацию (basic.nack / unroutable).
@@ -18,8 +25,17 @@ class PublishRejected(Exception):
     иначе «ядовитая» запись ретраилась бы бесконечно.
     """
 
+    def __init__(
+        self,
+        *,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+
 
 class MessagePublisher(Protocol):
+    """Контракт публикации сообщений с подтверждением брокера."""
+
     async def publish(
         self,
         *,

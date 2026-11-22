@@ -2,17 +2,25 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 from payment.domain.events import PaymentCreated, PaymentFailed, PaymentSucceeded
 from payment.domain.exceptions import InvalidStatusTransition
 from payment.domain.model.enums import PaymentStatus
-from payment.domain.model.value_objects import IdempotencyKey, Money, PaymentId, WebhookUrl
+from payment.domain.model.value_objects import (
+    IdempotencyKey,
+    Money,
+    PaymentId,
+    WebhookUrl,
+)
 
 _DomainEvent = Union[PaymentCreated, PaymentSucceeded, PaymentFailed]
 
 
-@dataclass(slots=True)
+@dataclass(
+    slots=True,
+    kw_only=True,
+)
 class Payment:
     """Корень агрегата: владеет статусом и переходами pending -> succeeded|failed.
 
@@ -29,13 +37,22 @@ class Payment:
     idempotency_key: IdempotencyKey
     webhook_url: WebhookUrl
     status: PaymentStatus = PaymentStatus.PENDING
-    fingerprint: Optional[str] = None  # sha256 тела исходного запроса (для 409 по idempotency)
+    fingerprint: Optional[str] = (
+        None  # sha256 тела исходного запроса (для 409 по idempotency)
+    )
     failure_reason: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     processed_at: Optional[datetime] = None
     # внутренний клейм обработки: не отдаётся в API, защищает от двойного списания
     locked_until: Optional[datetime] = None
-    _events: list[_DomainEvent] = field(default_factory=list, repr=False, compare=False)
+    _events: list[_DomainEvent] = field(
+        default_factory=lambda: cast(
+            list[_DomainEvent],
+            [],
+        ),
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def create(
@@ -71,32 +88,54 @@ class Payment:
         )
         return payment
 
-    def mark_succeeded(self, *, processed_at: Optional[datetime] = None) -> None:
+    def mark_succeeded(
+        self,
+        *,
+        processed_at: Optional[datetime] = None,
+    ) -> None:
         """pending -> succeeded и событие PaymentSucceeded.
 
         InvalidStatusTransition, если платёж уже финализирован: повторная
         обработка не должна переписывать исход.
         """
         if self.status is not PaymentStatus.PENDING:
-            raise InvalidStatusTransition(self.status.value, PaymentStatus.SUCCEEDED.value)
+            raise InvalidStatusTransition(
+                current=self.status.value,
+                target=PaymentStatus.SUCCEEDED.value,
+            )
         self.status = PaymentStatus.SUCCEEDED
         self.processed_at = processed_at or datetime.now(timezone.utc)
         self._events.append(
-            PaymentSucceeded(payment_id=self.id.value, processed_at=self.processed_at)
+            PaymentSucceeded(
+                payment_id=self.id.value,
+                processed_at=self.processed_at,
+            )
         )
 
-    def mark_failed(self, *, reason: str, processed_at: Optional[datetime] = None) -> None:
+    def mark_failed(
+        self,
+        *,
+        reason: str,
+        processed_at: Optional[datetime] = None,
+    ) -> None:
         """pending -> failed с причиной и событием PaymentFailed.
 
         InvalidStatusTransition при повторном вызове: исход платежа неизменен.
         """
         if self.status is not PaymentStatus.PENDING:
-            raise InvalidStatusTransition(self.status.value, PaymentStatus.FAILED.value)
+            raise InvalidStatusTransition(
+                current=self.status.value,
+                target=PaymentStatus.FAILED.value,
+            )
         self.status = PaymentStatus.FAILED
         self.failure_reason = reason
         self.processed_at = processed_at or datetime.now(timezone.utc)
         self._events.append(
-            PaymentFailed(payment_id=self.id.value, reason=reason, processed_at=self.processed_at)
+            PaymentFailed(
+                payment_id=self.id.value,
+                reason=reason,
+                processed_at=self.processed_at,
+            )
         )
 
     def collect_events(self) -> list[_DomainEvent]:

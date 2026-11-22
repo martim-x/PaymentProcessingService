@@ -1,8 +1,9 @@
 """Репозиторий платежей на SQLAlchemy (ручной маппинг домена)."""
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import Row, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,17 +11,25 @@ from payment.adapters.persistence.orm import payments_table
 from payment.application.exceptions import IdempotencyViolation
 from payment.domain.model.enums import Currency, PaymentStatus
 from payment.domain.model.payment import Payment
-from payment.domain.model.value_objects import IdempotencyKey, Money, PaymentId, WebhookUrl
+from payment.domain.model.value_objects import (
+    IdempotencyKey,
+    Money,
+    PaymentId,
+    WebhookUrl,
+)
 
 
-def _to_domain(row) -> Payment:
+def _to_domain(row: Row[Any]) -> Payment:
     return Payment(
         id=PaymentId(value=row.id),
-        amount=Money(amount=row.amount, currency=Currency(row.currency)),
+        amount=Money(
+            amount=row.amount,
+            currency=Currency(row.currency),
+        ),
         description=row.description,
-        metadata=dict(row._mapping["metadata"]),
-        idempotency_key=IdempotencyKey(row.idempotency_key),
-        webhook_url=WebhookUrl(row.webhook_url),
+        metadata=dict(row.metadata),
+        idempotency_key=IdempotencyKey(value=row.idempotency_key),
+        webhook_url=WebhookUrl(value=row.webhook_url),
         status=PaymentStatus(row.status),
         fingerprint=row.fingerprint,
         failure_reason=row.failure_reason,
@@ -29,7 +38,7 @@ def _to_domain(row) -> Payment:
     )
 
 
-def _to_row_values(payment: Payment) -> dict:
+def _to_row_values(payment: Payment) -> dict[str, Any]:
     return {
         "id": payment.id.value,
         "amount": payment.amount.amount,
@@ -47,17 +56,36 @@ def _to_row_values(payment: Payment) -> dict:
 
 
 class SqlAlchemyPaymentRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    """Хранит платежи в SQLAlchemy, преобразуя строки в доменные объекты."""
+
+    def __init__(
+        self,
+        *,
+        session: AsyncSession,
+    ) -> None:
         self._session = session
 
-    async def add(self, payment: Payment) -> None:
+    async def add(
+        self,
+        *,
+        payment: Payment,
+    ) -> None:
         try:
-            await self._session.execute(insert(payments_table).values(**_to_row_values(payment)))
+            await self._session.execute(
+                insert(payments_table).values(**_to_row_values(payment))
+            )
         except IntegrityError as exc:
             # уникальность idempotency_key: наружу — не SQLAlchemy, а application-исключение
-            raise IdempotencyViolation(payment.idempotency_key.value) from exc
+            raise IdempotencyViolation(
+                idempotency_key=payment.idempotency_key.value
+            ) from exc
 
-    async def try_claim(self, payment_id: PaymentId, ttl_seconds: float) -> datetime | None:
+    async def try_claim(
+        self,
+        *,
+        payment_id: PaymentId,
+        ttl_seconds: float,
+    ) -> datetime | None:
         """Атомарный клейм: pending + свободен/протух -> locked_until = now() + ttl."""
         now = datetime.now(timezone.utc)
         until = now + timedelta(seconds=ttl_seconds)
@@ -66,7 +94,8 @@ class SqlAlchemyPaymentRepository:
             .where(
                 payments_table.c.id == payment_id.value,
                 payments_table.c.status == PaymentStatus.PENDING.value,
-                (payments_table.c.locked_until.is_(None)) | (payments_table.c.locked_until < now),
+                (payments_table.c.locked_until.is_(None))
+                | (payments_table.c.locked_until < now),
             )
             .values(locked_until=until)
             .returning(payments_table.c.locked_until)
@@ -74,7 +103,12 @@ class SqlAlchemyPaymentRepository:
         row = result.first()
         return row.locked_until if row is not None else None
 
-    async def release_claim(self, payment_id: PaymentId, claim_token: datetime) -> None:
+    async def release_claim(
+        self,
+        *,
+        payment_id: PaymentId,
+        claim_token: datetime,
+    ) -> None:
         await self._session.execute(
             update(payments_table)
             .where(
@@ -84,7 +118,12 @@ class SqlAlchemyPaymentRepository:
             .values(locked_until=None)
         )
 
-    async def try_finalize(self, payment: Payment, claim_token: datetime) -> bool:
+    async def try_finalize(
+        self,
+        *,
+        payment: Payment,
+        claim_token: datetime,
+    ) -> bool:
         """UPDATE под клеймом: id + pending + locked_until = токен."""
         result = await self._session.execute(
             update(payments_table)
@@ -103,14 +142,22 @@ class SqlAlchemyPaymentRepository:
         )
         return result.first() is not None
 
-    async def get(self, payment_id: PaymentId) -> Payment | None:
+    async def get(
+        self,
+        *,
+        payment_id: PaymentId,
+    ) -> Payment | None:
         result = await self._session.execute(
             select(payments_table).where(payments_table.c.id == payment_id.value)
         )
         row = result.first()
         return _to_domain(row) if row is not None else None
 
-    async def get_by_idempotency_key(self, key: str) -> Payment | None:
+    async def get_by_idempotency_key(
+        self,
+        *,
+        key: str,
+    ) -> Payment | None:
         result = await self._session.execute(
             select(payments_table).where(payments_table.c.idempotency_key == key)
         )

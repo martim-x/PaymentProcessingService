@@ -9,7 +9,7 @@ import ipaddress
 import uuid
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from payment.domain.exceptions import InvalidMoney, InvalidWebhookUrl
@@ -20,7 +20,11 @@ _MONEY_QUANT = Decimal("0.0001")
 _MONEY_MAX = Decimal("999999999999999.9999")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class Money:
     """Сумма с валютой, приведённая к точности БД.
 
@@ -33,24 +37,58 @@ class Money:
     currency: Currency
 
     def __post_init__(self) -> None:
-        if not isinstance(self.amount, Decimal):
-            raise InvalidMoney(self.amount, "amount must be Decimal")
+        if not isinstance(
+            cast(
+                object,
+                self.amount,
+            ),
+            Decimal,
+        ):
+            raise InvalidMoney(
+                amount=self.amount,
+                reason="amount must be Decimal",
+            )
         if not self.amount.is_finite() or self.amount <= 0:
-            raise InvalidMoney(self.amount, "amount must be positive")
+            raise InvalidMoney(
+                amount=self.amount,
+                reason="amount must be positive",
+            )
         # нормализация точности до 4 знаков (Numeric(19,4) в БД)
         try:
-            quantized = self.amount.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
+            quantized = self.amount.quantize(
+                _MONEY_QUANT,
+                rounding=ROUND_HALF_UP,
+            )
         except InvalidOperation as exc:
-            raise InvalidMoney(self.amount, "amount exceeds the supported precision") from exc
+            raise InvalidMoney(
+                amount=self.amount,
+                reason="amount exceeds the supported precision",
+            ) from exc
         if quantized <= 0:
-            raise InvalidMoney(self.amount, "amount rounds to zero at the supported precision")
+            raise InvalidMoney(
+                amount=self.amount,
+                reason="amount rounds to zero at the supported precision",
+            )
         if quantized > _MONEY_MAX:
-            raise InvalidMoney(self.amount, "amount exceeds the supported maximum")
-        object.__setattr__(self, "amount", quantized)
+            raise InvalidMoney(
+                amount=self.amount,
+                reason="amount exceeds the supported maximum",
+            )
+        object.__setattr__(
+            self,
+            "amount",
+            quantized,
+        )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class PaymentId:
+    """Типизированный идентификатор платежа."""
+
     value: uuid.UUID
 
     @staticmethod
@@ -58,7 +96,7 @@ class PaymentId:
         return PaymentId(value=uuid.uuid4())
 
     @staticmethod
-    def from_string(raw: str) -> "PaymentId":
+    def from_string(*, raw: str) -> "PaymentId":
         """ValueError, если строка не UUID: API трактует это как 404, а не 500."""
         return PaymentId(value=uuid.UUID(raw))
 
@@ -66,7 +104,11 @@ class PaymentId:
         return str(self.value)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class IdempotencyKey:
     """Ключ клиента для защиты от дублей: непустой, до 255 символов.
 
@@ -77,14 +119,31 @@ class IdempotencyKey:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value.strip():
+        if (
+            not isinstance(
+                cast(
+                    object,
+                    self.value,
+                ),
+                str,
+            )
+            or not self.value.strip()
+        ):
             raise ValueError("IdempotencyKey must be a non-empty string")
         if len(self.value) > 255:
             raise ValueError("IdempotencyKey must be at most 255 characters")
-        object.__setattr__(self, "value", self.value)
+        object.__setattr__(
+            self,
+            "value",
+            self.value,
+        )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class WebhookUrl:
     """Адрес уведомления: только http(s) с непустым хостом.
 
@@ -96,17 +155,24 @@ class WebhookUrl:
 
     def __post_init__(self) -> None:
         if not self.value:
-            raise InvalidWebhookUrl(self.value)
+            raise InvalidWebhookUrl(url=self.value)
         parsed = urlsplit(self.value)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise InvalidWebhookUrl(self.value)
+        if (
+            parsed.scheme
+            not in (
+                "http",
+                "https",
+            )
+            or not parsed.hostname
+        ):
+            raise InvalidWebhookUrl(url=self.value)
         # литеральный приватный/loopback IP отклоняем сразу (без DNS) — 422 на API
         try:
             address = ipaddress.ip_address(parsed.hostname)
         except ValueError:
             return
         if not _ip_is_public(address):
-            raise InvalidWebhookUrl(self.value)
+            raise InvalidWebhookUrl(url=self.value)
 
 
 def _ip_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -122,5 +188,12 @@ def to_decimal(raw: Any) -> Decimal:
     """
     try:
         return Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise InvalidMoney(raw, "not a valid decimal") from exc
+    except (
+        InvalidOperation,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise InvalidMoney(
+            amount=raw,
+            reason="not a valid decimal",
+        ) from exc

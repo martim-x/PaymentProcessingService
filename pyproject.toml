@@ -29,15 +29,28 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.black]
+line-length = 88
+target-version = ["py315"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+markers = [
+    "unit: fast isolated unit tests",
+    "adapters: adapter-layer tests",
+    "application: application-layer tests",
+    "domain: domain-layer tests",
+    "entrypoints: entrypoint-layer tests",
+    "contracts: cross-layer signature and construction contracts",
+    "config: configuration tests",
+]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py315"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "BLE", "S"]

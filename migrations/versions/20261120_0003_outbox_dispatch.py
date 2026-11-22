@@ -37,10 +37,18 @@ def upgrade() -> None:
         "ix_outbox_relay_pending",
         "outbox",
         ["created_at"],
-        postgresql_where=sa.text("sent = false AND failed = false AND dispatch = 'relay'"),
+        postgresql_where=sa.text(
+            "sent = false AND failed = false AND dispatch = 'relay'"
+        ),
     )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_outbox_relay_pending", table_name="outbox")
-    op.drop_column("outbox", "dispatch")
+    op.drop_index(
+        "ix_outbox_relay_pending",
+        table_name="outbox",
+    )
+    op.drop_column(
+        "outbox",
+        "dispatch",
+    )

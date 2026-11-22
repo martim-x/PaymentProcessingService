@@ -41,7 +41,12 @@ def _transient_types() -> tuple[type[BaseException], ...]:
     except ImportError:  # pragma: no cover — psycopg обязателен в проде
         pass
     else:
-        types.extend([psycopg.OperationalError, psycopg.InterfaceError])
+        types.extend(
+            [
+                psycopg.OperationalError,
+                psycopg.InterfaceError,
+            ]
+        )
     try:
         from aio_pika.exceptions import AMQPConnectionError
     except ImportError:  # pragma: no cover — aio-pika приходит с faststream[rabbit]
@@ -61,7 +66,10 @@ def is_transient_infra_error(exc: BaseException) -> bool:
     for _ in range(_MAX_CAUSE_DEPTH + 1):
         if current is None:
             return False
-        if isinstance(current, _transient_types()):
+        if isinstance(
+            current,
+            _transient_types(),
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False

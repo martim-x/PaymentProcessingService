@@ -17,27 +17,55 @@ DEFAULT_TOLERANCE_SECONDS = 300
 
 def serialize(payload: dict[str, Any]) -> bytes:
     """Канонический JSON-байтстрим: стабильный порядок ключей, без пробелов."""
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(
+            ",",
+            ":",
+        ),
+    ).encode("utf-8")
 
 
-def _digest(secret: str, body: bytes, timestamp: int) -> str:
+def _digest(
+    secret: str,
+    body: bytes,
+    timestamp: int,
+) -> str:
     message = str(timestamp).encode("ascii") + b"." + body
-    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    return hmac.new(
+        secret.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
 
 
-def sign_body(secret: str, body: bytes, timestamp: int | None = None) -> tuple[str, int]:
+def sign_body(
+    secret: str,
+    body: bytes,
+    timestamp: int | None = None,
+) -> tuple[str, int]:
     """Возвращает (значение X-Signature, timestamp) для готового тела запроса."""
     ts = int(timestamp if timestamp is not None else time.time())
-    return f"t={ts},v1={_digest(secret, body, ts)}", ts
+    return f"t={ts},v1={_digest(secret, body, ts,)}", ts
 
 
 def parse_signature_header(header: str) -> tuple[int, str] | None:
-    parts = dict(chunk.split("=", 1) for chunk in header.split(",") if "=" in chunk)
+    parts = dict(
+        chunk.split(
+            "=",
+            1,
+        )
+        for chunk in header.split(",")
+        if "=" in chunk
+    )
     try:
         return int(parts["t"]), parts["v1"]
-    except (KeyError, ValueError):
+    except (
+        KeyError,
+        ValueError,
+    ):
         return None
 
 
@@ -57,5 +85,12 @@ def verify_body(
     current = now if now is not None else int(time.time())
     if abs(current - timestamp) > tolerance:
         return False
-    expected = _digest(secret, body, timestamp)
-    return hmac.compare_digest(expected, provided)
+    expected = _digest(
+        secret,
+        body,
+        timestamp,
+    )
+    return hmac.compare_digest(
+        expected,
+        provided,
+    )

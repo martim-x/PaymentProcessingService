@@ -3,7 +3,11 @@
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+    kw_only=True,
+)
 class ExponentialBackoffRetryPolicy:
     """Попытки нумеруются с 1: delay = base * factor ** (attempt - 1)."""
 
@@ -17,11 +21,19 @@ class ExponentialBackoffRetryPolicy:
         if self.base_delay < 0 or self.factor <= 0:
             raise ValueError("base_delay must be >= 0 and factor > 0")
 
-    def is_exhausted(self, *, attempts: int) -> bool:
+    def is_exhausted(
+        self,
+        *,
+        attempts: int,
+    ) -> bool:
         """True, если исчерпаны все попытки (дальше ретраить нельзя)."""
         return attempts >= self.max_attempts
 
-    def delay_for_attempt(self, attempt: int) -> float:
+    def delay_for_attempt(
+        self,
+        *,
+        attempt: int,
+    ) -> float:
         """Задержка перед указанной попыткой (1-индексация)."""
         if attempt < 1:
             raise ValueError("attempt starts at 1")

@@ -8,9 +8,22 @@ class ApplicationError(Exception):
 class PaymentBusy(ApplicationError):
     """Платёж в работе у другого consumer'а: сообщение должно уйти в retry, а не ack."""
 
+    def __init__(
+        self,
+        *,
+        payment_id: str,
+    ) -> None:
+        super().__init__(payment_id)
+
 
 class PaymentNotFound(ApplicationError):
-    def __init__(self, payment_id: str) -> None:
+    """Платёж с указанным идентификатором не найден."""
+
+    def __init__(
+        self,
+        *,
+        payment_id: str,
+    ) -> None:
         self.payment_id = payment_id
         super().__init__(f"Payment {payment_id} not found")
 
@@ -18,11 +31,22 @@ class PaymentNotFound(ApplicationError):
 class IdempotencyViolation(ApplicationError):
     """Нарушен unique-индекс idempotency_key (гонка двух одновременных POST)."""
 
+    def __init__(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> None:
+        super().__init__(idempotency_key)
+
 
 class IdempotencyConflict(ApplicationError):
     """Тот же Idempotency-Key, но другое тело запроса."""
 
-    def __init__(self, idempotency_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> None:
         self.idempotency_key = idempotency_key
         super().__init__(
             f"Idempotency-Key {idempotency_key!r} was already used with a different payload"
@@ -32,15 +56,27 @@ class IdempotencyConflict(ApplicationError):
 class WebhookBusy(ApplicationError):
     """Событие доставки обрабатывается другим consumer'ом: нужен retry, не ack."""
 
-    def __init__(self, event_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        event_id: str,
+    ) -> None:
         self.event_id = event_id
-        super().__init__(f"Webhook event {event_id} is being delivered by another consumer")
+        super().__init__(
+            f"Webhook event {event_id} is being delivered by another consumer"
+        )
 
 
 class WebhookDeliveryFailed(ApplicationError):
     """Отправка webhook не удалась; попытка учтена, сообщение уходит в retry."""
 
-    def __init__(self, event_id: str, attempt: int, error: str) -> None:
+    def __init__(
+        self,
+        *,
+        event_id: str,
+        attempt: int,
+        error: str,
+    ) -> None:
         self.event_id = event_id
         self.attempt = attempt
         self.error = error
@@ -50,8 +86,16 @@ class WebhookDeliveryFailed(ApplicationError):
 class WebhookDeliveryExhausted(ApplicationError):
     """Все попытки доставки исчерпаны: задача мертва, сообщение идёт в DLQ."""
 
-    def __init__(self, event_id: str, attempts: int, error: str) -> None:
+    def __init__(
+        self,
+        *,
+        event_id: str,
+        attempts: int,
+        error: str,
+    ) -> None:
         self.event_id = event_id
         self.attempts = attempts
         self.error = error
-        super().__init__(f"Webhook event {event_id} failed after {attempts} attempt(s): {error}")
+        super().__init__(
+            f"Webhook event {event_id} failed after {attempts} attempt(s): {error}"
+        )

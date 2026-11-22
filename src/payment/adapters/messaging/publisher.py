@@ -49,13 +49,25 @@ _UNAVAILABLE_TYPES: tuple[type[BaseException], ...] = (
 
 
 def _is_unavailable(exc: BaseException) -> bool:
-    if isinstance(exc, PublisherUnavailable):
+    if isinstance(
+        exc,
+        PublisherUnavailable,
+    ):
         return True
-    return isinstance(exc, _UNAVAILABLE_TYPES)
+    return isinstance(
+        exc,
+        _UNAVAILABLE_TYPES,
+    )
 
 
 class FastStreamPublisher(MessagePublisher):
-    def __init__(self, broker: RabbitBroker) -> None:
+    """Публикует сообщения в RabbitMQ и проверяет подтверждение брокера."""
+
+    def __init__(
+        self,
+        *,
+        broker: RabbitBroker,
+    ) -> None:
         self._broker = broker
 
     async def publish(
@@ -76,12 +88,20 @@ class FastStreamPublisher(MessagePublisher):
             )
         except Exception as exc:
             if _is_unavailable(exc):
-                raise PublisherUnavailable(f"{type(exc).__name__}: {exc}") from exc
+                raise PublisherUnavailable(
+                    message=f"{type(exc).__name__}: {exc}"
+                ) from exc
             raise
-        _ensure_confirmed(confirmation, subject)
+        ensure_confirmed(
+            confirmation,
+            subject,
+        )
 
 
-def _ensure_confirmed(confirmation: object, subject: str) -> None:
+def ensure_confirmed(
+    confirmation: object,
+    subject: str,
+) -> None:
     """Publisher confirms: None и basic.nack — НЕ успешная публикация.
 
     - None: подтверждения выключены / соединение закрылось до ответа — это
@@ -92,6 +112,14 @@ def _ensure_confirmed(confirmation: object, subject: str) -> None:
       ещё внутри publish, сюда не доходит.
     """
     if confirmation is None:
-        raise PublisherUnavailable("broker did not confirm the publish")
-    if isinstance(confirmation, Basic.Nack) or confirmation is False:
-        raise PublishRejected(f"broker rejected the publish with basic.nack (queue={subject})")
+        raise PublisherUnavailable(message="broker did not confirm the publish")
+    if (
+        isinstance(
+            confirmation,
+            Basic.Nack,
+        )
+        or confirmation is False
+    ):
+        raise PublishRejected(
+            message=f"broker rejected the publish with basic.nack (queue={subject})"
+        )

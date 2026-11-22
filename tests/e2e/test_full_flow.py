@@ -19,10 +19,24 @@ import pytest
 
 from payment.adapters.webhook.signer import verify_body
 
-API_URL = os.environ.get("PAYMENT_API_URL", "http://localhost:8000")
-API_KEY = os.environ.get("PAYMENT_API_KEY", "local-dev-key")
-WEBHOOK_SECRET = os.environ.get("PAYMENT_WEBHOOK_SECRET", "local-webhook-secret")
-WEBHOOK_PORT = int(os.environ.get("PAYMENT_E2E_WEBHOOK_PORT", "9000"))
+API_URL = os.environ.get(
+    "PAYMENT_API_URL",
+    "http://localhost:8000",
+)
+API_KEY = os.environ.get(
+    "PAYMENT_API_KEY",
+    "local-dev-key",
+)
+WEBHOOK_SECRET = os.environ.get(
+    "PAYMENT_WEBHOOK_SECRET",
+    "local-webhook-secret",
+)
+WEBHOOK_PORT = int(
+    os.environ.get(
+        "PAYMENT_E2E_WEBHOOK_PORT",
+        "9000",
+    )
+)
 
 
 class WebhookCollector:
@@ -40,15 +54,34 @@ class WebhookCollector:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
                 body = self.rfile.read(int(self.headers["Content-Length"]))
-                server.received.append((self.headers.get("X-Signature"), body))
+                server.received.append(
+                    (
+                        self.headers.get("X-Signature"),
+                        body,
+                    )
+                )
                 self.send_response(200)
                 self.end_headers()
 
-            def log_message(self, *args) -> None:  # тишина в логах pytest
+            def log_message(
+                self,
+                format: str,
+                *args: object,
+            ) -> None:  # noqa: A002
+                # тишина в логах pytest
                 pass
 
-        self.httpd = HTTPServer(("0.0.0.0", WEBHOOK_PORT), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.httpd = HTTPServer(
+            (
+                "0.0.0.0",
+                WEBHOOK_PORT,
+            ),
+            Handler,
+        )
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever,
+            daemon=True,
+        )
 
     def start(self) -> None:
         self.thread.start()
@@ -60,7 +93,10 @@ class WebhookCollector:
     @staticmethod
     def docker_host_url() -> str:
         # consumer работает внутри контейнера: адрес хоста — host.docker.internal
-        host = os.environ.get("PAYMENT_WEBHOOK_PUBLIC_HOST", "host.docker.internal")
+        host = os.environ.get(
+            "PAYMENT_WEBHOOK_PUBLIC_HOST",
+            "host.docker.internal",
+        )
         return f"http://{host}:{WEBHOOK_PORT}/webhook"
 
     @staticmethod
@@ -68,7 +104,12 @@ class WebhookCollector:
         """Адрес коллектора для запросов из самого теста (без docker DNS)."""
         return f"http://127.0.0.1:{WEBHOOK_PORT}/webhook"
 
-    def wait_for(self, payment_id: str, timeout: float = 15.0) -> tuple[str | None, bytes]:
+    def wait_for(
+        self,
+        *,
+        payment_id: str,
+        timeout: float = 15.0,
+    ) -> tuple[str | None, bytes]:
         """Ждёт уведомление конкретного платежа, игнорируя чужие."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -77,7 +118,13 @@ class WebhookCollector:
                     payload = json.loads(raw_body)
                 except ValueError:
                     continue
-                if isinstance(payload, dict) and payload.get("id") == payment_id:
+                if (
+                    isinstance(
+                        payload,
+                        dict,
+                    )
+                    and payload.get("id") == payment_id
+                ):
                     return signature, raw_body
             time.sleep(0.2)
         seen = [json.loads(body).get("id") for _, body in list(self.received) if body]
@@ -95,10 +142,17 @@ def headers(idempotency_key: str) -> dict:
     }
 
 
-def wait_for_final_status(client: httpx.Client, payment_id: str, timeout: float = 30.0) -> dict:
+def wait_for_final_status(
+    client: httpx.Client,
+    payment_id: str,
+    timeout: float = 30.0,
+) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        r = client.get(f"{API_URL}/api/v1/payments/{payment_id}", headers={"X-API-Key": API_KEY})
+        r = client.get(
+            f"{API_URL}/api/v1/payments/{payment_id}",
+            headers={"X-API-Key": API_KEY},
+        )
         r.raise_for_status()
         payment = r.json()
         if payment["status"] != "pending":
@@ -123,7 +177,9 @@ class TestFullFlow:
             with httpx.Client(timeout=10.0) as client:
                 # 1. создание
                 r = client.post(
-                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
+                    f"{API_URL}/api/v1/payments",
+                    headers=headers(key),
+                    json=payload_json,
                 )
                 assert r.status_code == 202, r.text
                 body = r.json()
@@ -134,7 +190,9 @@ class TestFullFlow:
 
                 # 2. идемпотентный повтор — тот же платёж
                 r2 = client.post(
-                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
+                    f"{API_URL}/api/v1/payments",
+                    headers=headers(key),
+                    json=payload_json,
                 )
                 assert r2.status_code == 202
                 assert r2.json()["payment_id"] == payment_id
@@ -143,23 +201,39 @@ class TestFullFlow:
                 r3 = client.post(
                     f"{API_URL}/api/v1/payments",
                     headers=headers(key),
-                    json={**payload_json, "amount": "99.99", "currency": "USD"},
+                    json={
+                        **payload_json,
+                        "amount": "99.99",
+                        "currency": "USD",
+                    },
                 )
                 assert r3.status_code == 409, r3.text
 
                 # 4. обработка consumer'ом: 2-5 сек
-                payment = wait_for_final_status(client, payment_id)
-                assert payment["status"] in ("succeeded", "failed")
+                payment = wait_for_final_status(
+                    client,
+                    payment_id,
+                )
+                assert payment["status"] in (
+                    "succeeded",
+                    "failed",
+                )
                 assert payment["processed_at"] is not None
                 if payment["status"] == "failed":
                     assert payment["failure_reason"]
 
                 # 5. webhook дошёл и подпись валидна для СЫРЫХ байтов тела
-                signature, raw_body = collector.wait_for(payment_id, timeout=15.0)
-                assert signature is not None
-                assert verify_body(WEBHOOK_SECRET, raw_body, signature), (
-                    "signature does not match the delivered body"
+                signature, raw_body = collector.wait_for(
+                    payment_id=payment_id,
+                    timeout=15.0,
                 )
+                assert signature is not None
+                verified = verify_body(
+                    WEBHOOK_SECRET,
+                    raw_body,
+                    signature,
+                )
+                assert verified, "signature does not match the delivered body"
                 webhook_payload = json.loads(raw_body)
                 assert webhook_payload["id"] == payment_id
                 assert webhook_payload["status"] == payment["status"]
@@ -179,7 +253,11 @@ class TestFullFlow:
                 foreign_id = str(uuid.uuid4())
                 foreign = client.post(
                     collector.local_url(),
-                    json={"id": foreign_id, "event": "payment.succeeded", "event_id": "foreign"},
+                    json={
+                        "id": foreign_id,
+                        "event": "payment.succeeded",
+                        "event_id": "foreign",
+                    },
                 )
                 assert foreign.status_code == 200
 
@@ -191,17 +269,31 @@ class TestFullFlow:
                     "webhook_url": collector.docker_host_url(),
                 }
                 created = client.post(
-                    f"{API_URL}/api/v1/payments", headers=headers(key), json=payload_json
+                    f"{API_URL}/api/v1/payments",
+                    headers=headers(key),
+                    json=payload_json,
                 )
                 assert created.status_code == 202, created.text
                 payment_id = created.json()["payment_id"]
-                wait_for_final_status(client, payment_id)
+                wait_for_final_status(
+                    client,
+                    payment_id,
+                )
 
-                signature, raw_body = collector.wait_for(payment_id, timeout=20.0)
+                signature, raw_body = collector.wait_for(
+                    payment_id=payment_id,
+                    timeout=20.0,
+                )
                 delivered = json.loads(raw_body)
 
                 assert delivered["id"] == payment_id != foreign_id
-                assert verify_body(WEBHOOK_SECRET, raw_body, signature)
+                assert signature is not None
+                verified = verify_body(
+                    WEBHOOK_SECRET,
+                    raw_body,
+                    signature,
+                )
+                assert verified
         finally:
             collector.stop()
 
@@ -211,11 +303,35 @@ class TestFullFlow:
             assert r.status_code == 401
 
     @pytest.mark.parametrize(
-        ("headers", "expected_status"),
-        [({}, 401), ({"X-API-Key": "wrong-key"}, 401), ({"X-API-Key": API_KEY}, 200)],
+        (
+            "headers",
+            "expected_status",
+        ),
+        [
+            (
+                {},
+                401,
+            ),
+            (
+                {"X-API-Key": "wrong-key"},
+                401,
+            ),
+            (
+                {"X-API-Key": API_KEY},
+                200,
+            ),
+        ],
     )
-    def test_health_requires_api_key(self, headers: dict[str, str], expected_status: int) -> None:
-        response = httpx.get(f"{API_URL}/health", headers=headers, timeout=10.0)
+    def test_health_requires_api_key(
+        self,
+        headers: dict[str, str],
+        expected_status: int,
+    ) -> None:
+        response = httpx.get(
+            f"{API_URL}/health",
+            headers=headers,
+            timeout=10.0,
+        )
         assert response.status_code == expected_status
         if expected_status == 200:
             assert response.json() == {"status": "ok"}
@@ -223,6 +339,7 @@ class TestFullFlow:
     def test_unknown_payment_404(self) -> None:
         with httpx.Client(timeout=10.0) as client:
             r = client.get(
-                f"{API_URL}/api/v1/payments/{uuid.uuid4()}", headers={"X-API-Key": API_KEY}
+                f"{API_URL}/api/v1/payments/{uuid.uuid4()}",
+                headers={"X-API-Key": API_KEY},
             )
             assert r.status_code == 404

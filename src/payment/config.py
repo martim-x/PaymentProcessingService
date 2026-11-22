@@ -21,10 +21,19 @@ _INSECURE_DEFAULTS = {
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
+    """Настройки сервиса из переменных окружения с префиксом `PAYMENT_`."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="PAYMENT_",
+        env_file=".env",
+        extra="ignore",
+    )
 
     # API
-    api_key: str = Field(default="", description="X-API-Key; обязателен")
+    api_key: str = Field(
+        default="",
+        description="X-API-Key; обязателен",
+    )
 
     # PostgreSQL
     database_url: str = "postgresql+psycopg://payment:payment@postgres:5432/payments"
@@ -45,7 +54,10 @@ class Settings(BaseSettings):
 
     # Webhook
     webhook_timeout: float = 5.0
-    webhook_secret: str = Field(default="", description="HMAC-секрет; обязателен")
+    webhook_secret: str = Field(
+        default="",
+        description="HMAC-секрет; обязателен",
+    )
     # true только для локальных стендов/тестов: host.docker.internal — частный адрес
     webhook_allow_private_hosts: bool = False
 
@@ -85,7 +97,8 @@ class Settings(BaseSettings):
         """
         waits = self.max_attempts * self.claim_wait_seconds
         delays = sum(
-            self.retry_base_delay * (self.retry_factor**i) for i in range(self.max_attempts - 1)
+            self.retry_base_delay * (self.retry_factor**i)
+            for i in range(self.max_attempts - 1)
         )
         return waits + delays
 

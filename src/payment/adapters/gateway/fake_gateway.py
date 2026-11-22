@@ -7,6 +7,8 @@ from payment.application.ports.payment_gateway import GatewayResult, PaymentGate
 
 
 class FakePaymentGateway(PaymentGateway):
+    """Эмулирует внешний шлюз с настраиваемыми задержкой и вероятностью успеха."""
+
     def __init__(
         self,
         *,
@@ -28,8 +30,14 @@ class FakePaymentGateway(PaymentGateway):
         currency: str,
         idempotency_key: str = "",
     ) -> GatewayResult:
-        delay = self._rng.uniform(self._min, self._max)
+        delay = self._rng.uniform(
+            self._min,
+            self._max,
+        )
         await asyncio.sleep(delay)
         if self._rng.random() < self._success_rate:
             return GatewayResult(succeeded=True)
-        return GatewayResult(succeeded=False, reason="random gateway failure")
+        return GatewayResult(
+            succeeded=False,
+            reason="random gateway failure",
+        )

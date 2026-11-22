@@ -31,7 +31,7 @@ relay ── SELECT ... WHERE sent=false AND failed=false AND dispatch='relay' F
 `                 → ack | retry через payments.new TTL-цепочку | payments.dlq`
 ```
 
-Consumer регистрирует только подписку `payments.new`. Один handler последовательно вызывает обработку платежа, затем `WebhookService.deliver`, и подтверждает исходное сообщение после обоих шагов. Второго конвейера и второй очереди нет. Финализация платежа сохраняет команду уведомления в outbox с `dispatch='local'`: relay такие строки не выбирает, `sent` остаётся честным флагом публикации. Результат HTTP-доставки фиксируется в `webhook_deliveries`.
+Единственная подписка consumer — `payments.new`; webhook выполняется тем же handler. Retry-лестницы существуют отдельно для обычных и инфраструктурных ошибок, но отдельной очереди/подписки webhook нет. Повторы используют общий лимит; после исчерпания сообщение направляется в `payments.dlq`.
 
 ## С чего начать чтение
 
@@ -88,7 +88,8 @@ Consumer регистрирует только подписку `payments.new`. 
 - `services/webhook_service.py` — `WebhookService.deliver(command)`: идемпотентно создаёт задачу доставки, берёт клейм, отправляет HTTP-запрос, записывает итог под fencing token. Повторная доставка после падения между отправкой и записью статуса возможна — это at-least-once.
 - `services/outbox_service.py` — `OutboxService.publish_pending(batch=...)`: читает неотправленные записи, маршрутизирует по `event_type`, публикует и отмечает результат.
 - `ports/` — контракты, необходимые сценариям:
-  - `repositories.py`: `PaymentRepository`, `OutboxRepository`, `WebhookDeliveryRepository`, `AbstractUnitOfWork`, `OutboxRecord`, `WebhookDelivery`;
+  - `repositories.py`: `PaymentRepository`, `OutboxRepository`, `WebhookDeliveryRepository`, `OutboxRecord`, `WebhookDelivery`;
+  - `unit_of_work.py`: `AbstractUnitOfWork`;
   - `payment_gateway.py`: `PaymentGateway`, `GatewayResult`;
   - `webhook_sender.py`: `WebhookSender`;
   - `message_publisher.py`: `MessagePublisher`, `PublisherUnavailable`, `PublishRejected`.
@@ -121,7 +122,7 @@ Consumer регистрирует только подписку `payments.new`. 
 - `api/schemas.py` — Pydantic-модели HTTP-запроса/ответа и лимиты полей. Это формат API, не доменная модель.
 - `api/dependencies.py` — проверка `X-API-Key`, `Idempotency-Key` и создание `PaymentService` для запроса.
 - `api/error_handlers.py` — отображение ошибок приложения/домена в HTTP-ответы.
-- `consumer/app.py` — регистрирует одну подписку на `payments.new`. Её handler вызывает `PaymentService.process_payment`, затем `WebhookService.deliver`, и подтверждает сообщение после успеха. Ошибки маршрутизируют исходное сообщение через retry/DLQ основного конвейера. Второй очереди и второго consumer'а нет: весь путь — одна подписка.
+- `consumer/app.py` — регистрирует одну подписку на `payments.new`. Её handler вызывает `PaymentService.process_payment`, затем `WebhookService.deliver`, и подтверждает сообщение после успеха. Ошибки маршрутизируют исходное сообщение через retry/DLQ основного конвейера. Отдельной очереди и подписчика для webhook нет.
 
 - `relay/runner.py` — периодически запускает публикацию outbox и обрабатывает завершение процесса.
 
@@ -159,17 +160,17 @@ Consumer регистрирует только подписку `payments.new`. 
 | Сообщение не теряется при сбое публикации retry/DLQ | `redelivery.publish_or_requeue` (сначала publish, потом ack) |
 | Падение брокера не «сжигает» outbox | `PublisherUnavailable` не увеличивает `attempts` |
 | Тайминги клеймов и ретраев согласованы | `Settings`-валидаторы в `config.py` |
-| Схема миграций совпадает с `metadata` | `tests/unit/test_migration_schema_parity.py` |
+| Схема миграций совпадает с `metadata` | `tests/unit/adapters/persistence/test_migration_schema_parity.py` |
 
-Числовые значения (TTL retry-очередей 1 и 2 с, infra-лестница 2 и 4 с, клейм 30 с, бюджет ожидания дубликата 48 с) и их обоснование — в [`README.md`](../README.md#надёжность).
+Числовые значения (TTL retry-очередей 1 и 2 с, infra-лестница 2 и 4 с, клейм 30 с, бюджет ожидания дубликата 48 с) и их обоснование — в [`README.md`](../README.md#технические-решения).
 
 ## Текущий runtime и границы документации
 
-1. **Один активный конвейер consumer.** `docker-compose.yml` запускает consumer, который подписывается только на `payments.new`. Один handler выполняет `PaymentService.process_payment`, затем `WebhookService.deliver` до ACK. Других очередей и consumer'ов нет.
+1. **Один активный конвейер consumer.** `docker-compose.yml` запускает consumer, который подписывается только на `payments.new`. Один handler выполняет `PaymentService.process_payment`, затем `WebhookService.deliver` до ACK. Отдельной webhook-очереди или webhook-подписчика нет.
 2. **Сохранённый payload webhook не означает его отправку.** Во время финализации команда `payment.webhook` пишется в outbox с `dispatch='local'`: relay её не читает, `sent` не выставляется. Результат реальной HTTP-доставки ведётся в `webhook_deliveries`.
 3. **Повторная обработка.** Финализированный платёж не должен повторно проходить шлюз; при сбое webhook исходное сообщение `payments.new` повторяется, а `webhook_deliveries` обеспечивает сохранение состояния и идемпотентность доставки.
-4. **`event_id` — стаб.** `PaymentService.process_payment` генерирует `uuid4().hex` при финализации. Он стабилен для всех попыток доставки одного события (едет в outbox и в сообщении), но не выводится из состояния платежа и не является бизнес-ключом. В реальной системе это был бы id записи outbox или детерминированный ключ события.
-5. **Гарантия — at-least-once, не exactly-once.** Дубли возможны в очереди (перепубликация) и в доставке (падение между HTTP-ответом и записью `delivered`). Защита — ключи идемпотентности: `Idempotency-Key`, id платежа как ключ шлюза, `event_id` у получателя.
+4. **Стабильный `event_id`.** При финализации генерируется `uuid4().hex`; идентификатор хранится в `outbox` вместе с payload webhook и не меняется при повторной доставке. Исходное сообщение `payment.created` этого идентификатора не содержит.
+5. **Семантика повторов — at-least-once, не exactly-once.** Дубли возможны в очереди (перепубликация) и в доставке (падение между HTTP-ответом и записью `delivered`). Успешная доставка webhook не гарантирована: после исчерпания попыток сообщение уходит в DLQ. Защита от повторных эффектов — ключи идемпотентности: `Idempotency-Key`, id платежа как ключ шлюза, `event_id` у получателя.
 6. **Relay публикует внутри транзакции.** `FOR UPDATE SKIP LOCKED` берётся при выборке, `commit` — после публикации батча. Это упрощает код (нет статуса «publishing» и reclaim-логики), но блокировки строк живут, пока идёт публикация.
 
 Полный список эксплуатационных ограничений — в [`README.md`](../README.md#ограничения-осознанные).

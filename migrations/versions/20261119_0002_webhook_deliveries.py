@@ -20,22 +20,75 @@ depends_on: Sequence[str] | None = None
 def upgrade() -> None:
     op.create_table(
         "webhook_deliveries",
-        sa.Column("event_id", sa.String(64), primary_key=True, nullable=False),
-        sa.Column("payment_id", UUID(as_uuid=True), nullable=False),
-        sa.Column("status", sa.String(16), nullable=False, server_default=sa.text("'pending'")),
-        sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
-        sa.Column("last_error", sa.Text(), nullable=True),
-        sa.Column("locked_until", sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.Column("created_at", sa.TIMESTAMP(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.TIMESTAMP(timezone=True), nullable=False),
-        sa.Column("delivered_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column(
+            "event_id",
+            sa.String(64),
+            primary_key=True,
+            nullable=False,
+        ),
+        sa.Column(
+            "payment_id",
+            UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "status",
+            sa.String(16),
+            nullable=False,
+            server_default=sa.text("'pending'"),
+        ),
+        sa.Column(
+            "attempts",
+            sa.Integer(),
+            nullable=False,
+            server_default=sa.text("0"),
+        ),
+        sa.Column(
+            "last_error",
+            sa.Text(),
+            nullable=True,
+        ),
+        sa.Column(
+            "locked_until",
+            sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at",
+            sa.TIMESTAMP(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.TIMESTAMP(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "delivered_at",
+            sa.TIMESTAMP(timezone=True),
+            nullable=True,
+        ),
     )
-    op.create_index("ix_webhook_deliveries_payment_id", "webhook_deliveries", ["payment_id"])
+    op.create_index(
+        "ix_webhook_deliveries_payment_id",
+        "webhook_deliveries",
+        ["payment_id"],
+    )
     # relay выбирает записи по (sent, failed) и маршрутизирует по event_type
-    op.create_index("ix_outbox_event_type", "outbox", ["event_type"])
+    op.create_index(
+        "ix_outbox_event_type",
+        "outbox",
+        ["event_type"],
+    )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_outbox_event_type", table_name="outbox")
-    op.drop_index("ix_webhook_deliveries_payment_id", table_name="webhook_deliveries")
+    op.drop_index(
+        "ix_outbox_event_type",
+        table_name="outbox",
+    )
+    op.drop_index(
+        "ix_webhook_deliveries_payment_id",
+        table_name="webhook_deliveries",
+    )
     op.drop_table("webhook_deliveries")

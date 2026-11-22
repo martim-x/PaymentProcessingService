@@ -20,17 +20,22 @@ from payment.entrypoints.api.schemas import (
 )
 
 router = APIRouter(
-    prefix="/api/v1/payments", tags=["payments"], dependencies=[Depends(require_api_key)]
+    prefix="/api/v1/payments",
+    tags=["payments"],
+    dependencies=[Depends(require_api_key)],
 )
 
 
-def _command(body: CreatePaymentRequest, idempotency_key: str) -> CreatePaymentCommand:
+def _command(
+    body: CreatePaymentRequest,
+    idempotency_key: str,
+) -> CreatePaymentCommand:
     return CreatePaymentCommand(
         amount=to_decimal(body.amount),
         currency=Currency(body.currency),
         description=body.description,
         metadata=dict(body.metadata),
-        idempotency_key=IdempotencyKey(idempotency_key),
+        idempotency_key=IdempotencyKey(value=idempotency_key),
         webhook_url=body.webhook_url,
     )
 
@@ -47,7 +52,12 @@ async def create_payment(
     payment_service: Annotated[PaymentService, Depends(build_payment_service)],
     response: Response,
 ) -> PaymentAcceptedResponse:
-    result = await payment_service.create_payment(_command(body, idempotency_key))
+    result = await payment_service.create_payment(
+        command=_command(
+            body,
+            idempotency_key,
+        )
+    )
     if result.created:
         response.headers["Location"] = f"/api/v1/payments/{result.payment.id}"
     return PaymentAcceptedResponse(
@@ -57,15 +67,19 @@ async def create_payment(
     )
 
 
-@router.get("/{payment_id}", response_model=PaymentDetailResponse)
+@router.get(
+    "/{payment_id}",
+    response_model=PaymentDetailResponse,
+)
 async def get_payment(
     payment_id: str,
     payment_service: Annotated[PaymentService, Depends(build_payment_service)],
 ) -> PaymentDetails:
     try:
-        pid = PaymentId.from_string(payment_id)
+        pid = PaymentId.from_string(raw=payment_id)
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found",
         ) from exc
-    return await payment_service.get_payment(pid)
+    return await payment_service.get_payment(payment_id=pid)

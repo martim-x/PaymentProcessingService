@@ -11,8 +11,12 @@ from typing import Any
 
 from faststream.rabbit import RabbitBroker, RabbitMessage
 
-from payment.adapters.messaging.publisher import _ensure_confirmed
-from payment.adapters.messaging.routing import ATTEMPT_HEADER, INFRA_ATTEMPT_HEADER, FailureRoute
+from payment.adapters.messaging.publisher import ensure_confirmed
+from payment.adapters.messaging.routing import (
+    ATTEMPT_HEADER,
+    INFRA_ATTEMPT_HEADER,
+    FailureRoute,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,14 +25,20 @@ async def ack_safely(message: RabbitMessage) -> None:
     try:
         await message.ack()
     except Exception:  # noqa: S110 — ack может упасть при разрыве соединения
-        logger.debug("ack failed", exc_info=True)
+        logger.debug(
+            "ack failed",
+            exc_info=True,
+        )
 
 
 async def requeue_safely(message: RabbitMessage) -> None:
     try:
         await message.nack(requeue=True)
     except Exception:  # noqa: S110 — соединение уже потеряно: брокер вернёт сам
-        logger.debug("nack(requeue) failed", exc_info=True)
+        logger.debug(
+            "nack(requeue) failed",
+            exc_info=True,
+        )
 
 
 async def publish_or_requeue(
@@ -52,9 +62,15 @@ async def publish_or_requeue(
             mandatory=True,
             headers=headers,
         )
-        _ensure_confirmed(confirmation, queue)
+        ensure_confirmed(
+            confirmation,
+            queue,
+        )
     except Exception:  # noqa: BLE001 — сообщение нельзя терять из-за сбоя publish
-        logger.exception("publish to %s failed; requeueing the original message", queue)
+        logger.exception(
+            "publish to %s failed; requeueing the original message",
+            queue,
+        )
         await requeue_safely(message)
         return False
     await ack_safely(message)
@@ -78,7 +94,10 @@ async def publish_failure(
     if decision.action == "retry":
         headers = {
             header: message.headers[header]
-            for header in (ATTEMPT_HEADER, INFRA_ATTEMPT_HEADER)
+            for header in (
+                ATTEMPT_HEADER,
+                INFRA_ATTEMPT_HEADER,
+            )
             if header in (message.headers or {})
         }
         headers[decision.header] = decision.header_value
