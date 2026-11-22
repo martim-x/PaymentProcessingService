@@ -20,6 +20,9 @@ pytestmark = [
 
 
 class TestMoney:
+    def test_from_raw_preserves_decimal_string_conversion(self) -> None:
+        assert Money.from_raw(raw=0.1) == Decimal("0.1")
+
     def test_creates_money_with_positive_amount(self) -> None:
         money = Money(
             amount=Decimal("100.50"),
@@ -67,6 +70,10 @@ class TestMoney:
 
 
 class TestIdempotencyKey:
+    def test_accepts_key_at_contract_length(self) -> None:
+        value = "a" * 255
+        assert IdempotencyKey(value=value).value == value
+
     def test_accepts_non_empty_string(self) -> None:
         key = IdempotencyKey(value="order-123")
 
@@ -86,6 +93,12 @@ class TestIdempotencyKey:
 
 
 class TestWebhookUrl:
+    def test_public_ip_predicate_is_owned_by_url(self) -> None:
+        import ipaddress
+
+        assert WebhookUrl._ip_is_public(ipaddress.ip_address("93.184.216.34"))
+        assert not WebhookUrl._ip_is_public(ipaddress.ip_address("127.0.0.1"))
+
     def test_accepts_https_url(self) -> None:
         url = WebhookUrl(value="https://example.com/hook")
 

@@ -10,7 +10,7 @@ from payment.application.exceptions import (
     WebhookDeliveryExhausted,
     WebhookDeliveryFailed,
 )
-from payment.application.ports.repositories import DELIVERY_DELIVERED, DELIVERY_FAILED
+from payment.application.ports.repositories import WebhookDeliveryStatus
 from payment.application.services.webhook_service import WebhookService
 from tests.fakes import FakeUnitOfWork, FakeWebhookSender
 
@@ -59,12 +59,12 @@ class TestSuccessfulDelivery:
             sender,
         ).deliver(command=command())
 
-        assert result.status == DELIVERY_DELIVERED
+        assert result.status == WebhookDeliveryStatus.DELIVERED
         assert result.already_delivered is False
         assert sender.calls == 1
         assert sender.sent[0]["url"] == "https://example.com/hook"
         record = await uow.webhook_deliveries.get(event_id="evt-1")
-        assert record is not None and record.status == DELIVERY_DELIVERED
+        assert record is not None and record.status == WebhookDeliveryStatus.DELIVERED
 
     async def test_duplicate_message_after_delivery_is_not_resent(self) -> None:
         uow = FakeUnitOfWork()
@@ -125,7 +125,7 @@ class TestRetries:
             sender,
         ).deliver(command=command())
 
-        assert result.status == DELIVERY_DELIVERED
+        assert result.status == WebhookDeliveryStatus.DELIVERED
         assert sender.calls == 2
 
     async def test_exhausted_delivery_becomes_terminal(self) -> None:
@@ -148,7 +148,7 @@ class TestRetries:
         record = await uow.webhook_deliveries.get(event_id="evt-1")
         assert record is not None
         assert record.attempts == 2
-        assert record.status == DELIVERY_FAILED
+        assert record.status == WebhookDeliveryStatus.FAILED
         # третьей отправки нет: задача мертва
         with pytest.raises(WebhookDeliveryExhausted):
             await service(
@@ -203,7 +203,10 @@ class TestRetries:
         # at-least-once: получатель обязан дедуплицировать по event_id
         assert sender.calls == 2
         delivered = await uow.webhook_deliveries.get(event_id="evt-1")
-        assert delivered is not None and delivered.status == DELIVERY_DELIVERED
+        assert (
+            delivered is not None
+            and delivered.status == WebhookDeliveryStatus.DELIVERED
+        )
 
 
 class TestTaskLifecycle:

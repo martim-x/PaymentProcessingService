@@ -4,110 +4,18 @@ import json
 import math
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 CurrencyLiteral = Literal["RUB", "USD", "EUR"]
 
-MAX_METADATA_BYTES = 8192
-MAX_IDEMPOTENCY_KEY_LENGTH = 255
-_NUL = "\x00"
-
-
-def _reject_nul(
-    value: str,
-    path: str,
-) -> str:
-    if _NUL in value:
-        raise ValueError(f"{path} must not contain NUL (\\u0000) characters")
-    return value
-
-
-def _check_json_value(
-    value: Any,
-    path: str,
-) -> None:
-    """Отклоняет значения, которые PostgreSQL/JSON не примет или исказит.
-
-    NUL-байт в text/jsonb ломает вставку, а NaN/Infinity не являются
-    валидным JSON и роняют сериализацию ответа об ошибке.
-    """
-    if isinstance(
-        value,
-        str,
-    ):
-        _reject_nul(
-            value,
-            path,
-        )
-    elif (
-        isinstance(
-            value,
-            bool,
-        )
-        or value is None
-        or isinstance(
-            value,
-            int,
-        )
-    ):
-        return
-    elif isinstance(
-        value,
-        float,
-    ):
-        if not math.isfinite(value):
-            raise ValueError(f"{path} must be a finite number")
-    elif isinstance(
-        value,
-        Decimal,
-    ):
-        if not value.is_finite():
-            raise ValueError(f"{path} must be a finite number")
-    elif isinstance(
-        value,
-        dict,
-    ):
-        typed_value = cast(
-            dict[Any, Any],
-            value,
-        )
-        for key, item in typed_value.items():
-            if not isinstance(
-                key,
-                str,
-            ):
-                raise ValueError(f"{path} keys must be strings")
-            _reject_nul(
-                key,
-                f"{path} key",
-            )
-            _check_json_value(
-                item,
-                f"{path}.{key}",
-            )
-    elif isinstance(
-        value,
-        (
-            list,
-            tuple,
-        ),
-    ):
-        sequence_value = cast(
-            list[Any] | tuple[Any, ...],
-            value,
-        )
-        for index, item in enumerate(sequence_value):
-            _check_json_value(
-                item,
-                f"{path}[{index}]",
-            )
-
 
 class CreatePaymentRequest(BaseModel):
     """Проверенная схема тела запроса на создание платежа."""
+
+    _MAX_METADATA_BYTES: ClassVar[int] = 8192
 
     amount: Decimal = Field(
         gt=0,
@@ -124,16 +32,42 @@ class CreatePaymentRequest(BaseModel):
         examples=["https://example.com/webhook"],
     )
 
+    @staticmethod
+    def _reject_nul(*, value: str, path: str) -> str:
+        if "\x00" in value:
+            raise ValueError(f"{path} must not contain NUL (\\u0000) characters")
+        return value
+
+    @classmethod
+    def _check_json_value(cls, *, value: Any, path: str) -> None:
+        """Отклоняет значения, которые PostgreSQL/JSON не примет или исказит."""
+        if isinstance(value, str):
+            cls._reject_nul(value=value, path=path)
+        elif isinstance(value, (bool, int)) or value is None:
+            return
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"{path} must be a finite number")
+        elif isinstance(value, Decimal):
+            if not value.is_finite():
+                raise ValueError(f"{path} must be a finite number")
+        elif isinstance(value, dict):
+            for key, item in cast(dict[Any, Any], value).items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{path} keys must be strings")
+                cls._reject_nul(value=key, path=f"{path} key")
+                cls._check_json_value(value=item, path=f"{path}.{key}")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(cast(list[Any] | tuple[Any, ...], value)):
+                cls._check_json_value(value=item, path=f"{path}[{index}]")
+
     @field_validator("description")
     @classmethod
     def _description_chars(
         cls,
         value: str,
     ) -> str:
-        return _reject_nul(
-            value,
-            "description",
-        )
+        return cls._reject_nul(value=value, path="description")
 
     @field_validator("metadata")
     @classmethod
@@ -141,18 +75,17 @@ class CreatePaymentRequest(BaseModel):
         cls,
         value: dict[str, Any],
     ) -> dict[str, Any]:
-        _check_json_value(
-            value,
-            "metadata",
-        )
+        cls._check_json_value(value=value, path="metadata")
         # allow_nan=False: невалидный JSON не должен попасть в БД/событие
         encoded = json.dumps(
             value,
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
-        if len(encoded) > MAX_METADATA_BYTES:
-            raise ValueError(f"metadata must be at most {MAX_METADATA_BYTES} bytes")
+        if len(encoded) > cls._MAX_METADATA_BYTES:
+            raise ValueError(
+                f"metadata must be at most {cls._MAX_METADATA_BYTES} bytes"
+            )
         return value
 
 

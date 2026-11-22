@@ -2,12 +2,7 @@
 
 import pytest
 
-from payment.adapters.webhook.signer import (
-    parse_signature_header,
-    serialize,
-    sign_body,
-    verify_body,
-)
+from payment.adapters.webhook.signer import WebhookSigner
 
 pytestmark = [
     pytest.mark.unit,
@@ -25,13 +20,13 @@ PAYLOAD = {
 
 class TestSerialize:
     def test_key_order_does_not_change_bytes(self) -> None:
-        a = serialize(
+        a = WebhookSigner.serialize(
             {
                 "a": 1,
                 "b": 2,
             }
         )
-        b = serialize(
+        b = WebhookSigner.serialize(
             {
                 "b": 2,
                 "a": 1,
@@ -41,28 +36,37 @@ class TestSerialize:
         assert a == b
 
     def test_cyrillic_is_not_escaped(self) -> None:
-        assert "Заказ".encode() in serialize({"description": "Заказ"})
+        assert "Заказ".encode() in WebhookSigner.serialize({"description": "Заказ"})
 
 
 class TestSignBody:
-    def test_signature_header_format(self) -> None:
-        header, ts = sign_body(
-            SECRET,
-            serialize(PAYLOAD),
+    def test_known_hmac_vector_and_signature_header_format(self) -> None:
+        body = b"{}"
+        header, ts = WebhookSigner.sign_body(
+            "secret",
+            body,
+            timestamp=1,
         )
 
-        assert header.startswith(f"t={ts},v1=")
-        assert parse_signature_header(header) is not None
+        assert (
+            header
+            == "t=1,v1=1122767b193110cfec322b6f199b599edbf608ed087f2d27afb0b97d99523908"
+        )
+        assert WebhookSigner.parse_signature_header(header) == (
+            ts,
+            header.split("v1=", 1)[1],
+        )
+        assert WebhookSigner.parse_signature_header(header) is not None
 
     def test_verify_accepts_correct_signature(self) -> None:
-        body = serialize(PAYLOAD)
-        header, _ = sign_body(
+        body = WebhookSigner.serialize(PAYLOAD)
+        header, _ = WebhookSigner.sign_body(
             SECRET,
             body,
         )
 
         assert (
-            verify_body(
+            WebhookSigner.verify_body(
                 SECRET,
                 body,
                 header,
@@ -71,8 +75,8 @@ class TestSignBody:
         )
 
     def test_verify_rejects_tampered_body(self) -> None:
-        body = serialize(PAYLOAD)
-        header, _ = sign_body(
+        body = WebhookSigner.serialize(PAYLOAD)
+        header, _ = WebhookSigner.sign_body(
             SECRET,
             body,
         )
@@ -82,7 +86,7 @@ class TestSignBody:
         )
 
         assert (
-            verify_body(
+            WebhookSigner.verify_body(
                 SECRET,
                 tampered,
                 header,
@@ -91,14 +95,14 @@ class TestSignBody:
         )
 
     def test_verify_rejects_wrong_secret(self) -> None:
-        body = serialize(PAYLOAD)
-        header, _ = sign_body(
+        body = WebhookSigner.serialize(PAYLOAD)
+        header, _ = WebhookSigner.sign_body(
             SECRET,
             body,
         )
 
         assert (
-            verify_body(
+            WebhookSigner.verify_body(
                 "other-secret",
                 body,
                 header,
@@ -107,15 +111,15 @@ class TestSignBody:
         )
 
     def test_verify_rejects_stale_timestamp(self) -> None:
-        body = serialize(PAYLOAD)
-        header, ts = sign_body(
+        body = WebhookSigner.serialize(PAYLOAD)
+        header, ts = WebhookSigner.sign_body(
             SECRET,
             body,
             timestamp=1_000_000,
         )
 
         assert (
-            verify_body(
+            WebhookSigner.verify_body(
                 SECRET,
                 body,
                 header,
@@ -124,11 +128,25 @@ class TestSignBody:
             is False
         )
 
+    @pytest.mark.parametrize(
+        ("offset", "accepted"),
+        [(-301, False), (-300, True), (300, True), (301, False)],
+    )
+    def test_default_tolerance_includes_both_boundaries(
+        self, offset: int, accepted: bool
+    ) -> None:
+        body = b"{}"
+        header, ts = WebhookSigner.sign_body(SECRET, body, timestamp=1_000_000)
+
+        assert (
+            WebhookSigner.verify_body(SECRET, body, header, now=ts + offset) is accepted
+        )
+
     def test_verify_rejects_malformed_header(self) -> None:
         assert (
-            verify_body(
+            WebhookSigner.verify_body(
                 SECRET,
-                serialize(PAYLOAD),
+                WebhookSigner.serialize(PAYLOAD),
                 "sha256=deadbeef",
             )
             is False

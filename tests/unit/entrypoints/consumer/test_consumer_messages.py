@@ -8,7 +8,7 @@ import pytest
 from faststream.rabbit import RabbitBroker
 from faststream.rabbit.message import RabbitMessage
 
-from payment.entrypoints.consumer.app import parse_or_quarantine_message
+from payment.entrypoints.consumer.app import PaymentConsumer
 
 pytestmark = [
     pytest.mark.unit,
@@ -66,7 +66,7 @@ async def test_invalid_message_is_sent_to_dlq_and_acked(body: bytes) -> None:
     message = FakeMessage(body=body)
     broker = FakeBroker()
 
-    parsed = await parse_or_quarantine_message(
+    parsed = await PaymentConsumer.parse_or_quarantine_message(
         cast(
             RabbitMessage,
             message,
@@ -99,7 +99,7 @@ async def test_valid_message_returns_event_and_payment_id() -> None:
     message = FakeMessage(body=body)
     broker = FakeBroker()
 
-    parsed = await parse_or_quarantine_message(
+    parsed = await PaymentConsumer.parse_or_quarantine_message(
         cast(
             RabbitMessage,
             message,

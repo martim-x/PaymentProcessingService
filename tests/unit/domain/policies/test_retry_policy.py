@@ -3,9 +3,9 @@ from decimal import Decimal
 import pytest
 
 from payment.domain.model.enums import Currency
-from payment.domain.model.fingerprint import compute_fingerprint
+from payment.domain.model.fingerprint import PaymentFingerprint
 from payment.domain.model.value_objects import Money
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 
 pytestmark = [
     pytest.mark.unit,
@@ -42,4 +42,4 @@ class TestExponentialBackoffRetryPolicy:
             amount=Decimal("1"),
             currency=Currency.RUB,
         )
-        assert compute_fingerprint({"amount": str(m.amount)}) is not None
+        assert PaymentFingerprint.compute(payload={"amount": str(m.amount)}) is not None

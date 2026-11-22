@@ -6,40 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payment.adapters.gateway.fake_gateway import FakePaymentGateway
 from payment.adapters.messaging.publisher import FastStreamPublisher
-from payment.adapters.persistence.database import make_engine, make_sessionmaker
+from payment.adapters.persistence.database import SqlAlchemyDatabase
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
 from payment.adapters.webhook.http_sender import HttpxWebhookSender
-from payment.application.services.outbox_service import (
-    PAYMENT_CREATED_EVENT,
-    OutboxService,
-)
+from payment.application.event_types import OutboxEventType
+from payment.application.services.outbox_service import OutboxService
 from payment.application.services.payment_service import PaymentService
 from payment.application.services.webhook_service import WebhookService
-from payment.config import Settings, get_settings
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
-
-
-def make_channel(settings: Settings) -> Channel:
-    """Канал брокера: prefetch и confirms задаются здесь, а не в подписчике."""
-    return Channel(
-        prefetch_count=settings.consumer_prefetch,
-        publisher_confirms=True,
-        on_return_raises=True,
-    )
-
-
-def make_broker(settings: Settings) -> RabbitBroker:
-    """Брокер с явным каналом.
-
-    Prefetch задаётся на канале FastStream (`Channel`), а не через
-    `consume_args` подписчика (тот аргумент не доходил до aio-pika QoS).
-    `on_return_raises=True` превращает возврат mandatory-сообщения (нет
-    очереди) в `DeliveryError`, чтобы outbox не помечал запись отправленной.
-    """
-    return RabbitBroker(
-        settings.rabbitmq_url,
-        default_channel=make_channel(settings),
-    )
+from payment.config import Settings
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 
 
 class Container:
@@ -50,15 +25,15 @@ class Container:
         *,
         settings: Settings | None = None,
     ) -> None:
-        self.settings = settings or get_settings()
+        self.settings = settings or Settings.from_environment()
         self.retry_policy = ExponentialBackoffRetryPolicy(
             max_attempts=self.settings.max_attempts,
             base_delay=self.settings.retry_base_delay,
             factor=self.settings.retry_factor,
         )
-        self.engine = make_engine(self.settings.database_url)
-        self.sessionmaker: async_sessionmaker[AsyncSession] = make_sessionmaker(
-            self.engine
+        self.engine = SqlAlchemyDatabase.make_engine(self.settings.database_url)
+        self.sessionmaker: async_sessionmaker[AsyncSession] = (
+            SqlAlchemyDatabase.make_sessionmaker(self.engine)
         )
         self.gateway = FakePaymentGateway(
             min_seconds=self.settings.process_min_seconds,
@@ -104,15 +79,32 @@ class Container:
         return OutboxService(
             uow=self.uow(),
             publisher=self.get_broker_publisher(),
-            routes={PAYMENT_CREATED_EVENT: self.settings.rabbitmq_queue},
+            routes={
+                OutboxEventType.PAYMENT_CREATED.value: self.settings.rabbitmq_queue
+            },
             subject=self.settings.rabbitmq_queue,
             max_attempts=self.settings.outbox_max_attempts,
         )
 
     def get_broker(self) -> RabbitBroker:
         if self._broker is None:
-            self._broker = make_broker(self.settings)
+            self._broker = self._make_broker()
         return self._broker
+
+    def _make_channel(self) -> Channel:
+        """Канал: prefetch и confirms задаются здесь, не в подписчике."""
+        return Channel(
+            prefetch_count=self.settings.consumer_prefetch,
+            publisher_confirms=True,
+            on_return_raises=True,
+        )
+
+    def _make_broker(self) -> RabbitBroker:
+        """Брокер с каналом, подтверждениями и явной ошибкой unroutable."""
+        return RabbitBroker(
+            self.settings.rabbitmq_url,
+            default_channel=self._make_channel(),
+        )
 
     def get_broker_publisher(self) -> FastStreamPublisher:
         return FastStreamPublisher(broker=self.get_broker())

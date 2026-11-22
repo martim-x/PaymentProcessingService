@@ -9,15 +9,11 @@ import ipaddress
 import uuid
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import urlsplit
 
 from payment.domain.exceptions import InvalidMoney, InvalidWebhookUrl
 from payment.domain.model.enums import Currency
-
-_MONEY_QUANT = Decimal("0.0001")
-# Numeric(19,4): 15 целых цифр + 4 дробных
-_MONEY_MAX = Decimal("999999999999999.9999")
 
 
 @dataclass(
@@ -33,8 +29,20 @@ class Money:
     Нулевые, отрицательные и не-конечные суммы (NaN/Infinity) отсекаются.
     """
 
+    _MONEY_QUANT: ClassVar[Decimal] = Decimal("0.0001")
+    # Numeric(19,4): 15 целых цифр + 4 дробных
+    _MONEY_MAX: ClassVar[Decimal] = Decimal("999999999999999.9999")
+
     amount: Decimal
     currency: Currency
+
+    @staticmethod
+    def from_raw(*, raw: Any) -> Decimal:
+        """Convert input via str, preserving the established Decimal semantics."""
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise InvalidMoney(amount=raw, reason="not a valid decimal") from exc
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -56,7 +64,7 @@ class Money:
         # нормализация точности до 4 знаков (Numeric(19,4) в БД)
         try:
             quantized = self.amount.quantize(
-                _MONEY_QUANT,
+                self._MONEY_QUANT,
                 rounding=ROUND_HALF_UP,
             )
         except InvalidOperation as exc:
@@ -69,7 +77,7 @@ class Money:
                 amount=self.amount,
                 reason="amount rounds to zero at the supported precision",
             )
-        if quantized > _MONEY_MAX:
+        if quantized > self._MONEY_MAX:
             raise InvalidMoney(
                 amount=self.amount,
                 reason="amount exceeds the supported maximum",
@@ -110,33 +118,19 @@ class PaymentId:
     kw_only=True,
 )
 class IdempotencyKey:
-    """Ключ клиента для защиты от дублей: непустой, до 255 символов.
+    """Ключ клиента для защиты от дублей: непустой, до 255 символов."""
 
-    Значение не нормализуется: ключ сравнивается ровно так, как пришёл,
-    поэтому регистр и пробелы по краям значимы.
-    """
-
+    MAX_LENGTH: ClassVar[int] = 255
     value: str
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(
-                cast(
-                    object,
-                    self.value,
-                ),
-                str,
-            )
-            or not self.value.strip()
-        ):
+        if not isinstance(cast(object, self.value), str) or not self.value.strip():
             raise ValueError("IdempotencyKey must be a non-empty string")
-        if len(self.value) > 255:
-            raise ValueError("IdempotencyKey must be at most 255 characters")
-        object.__setattr__(
-            self,
-            "value",
-            self.value,
-        )
+        if len(self.value) > self.MAX_LENGTH:
+            raise ValueError(
+                f"IdempotencyKey must be at most {self.MAX_LENGTH} characters"
+            )
+        object.__setattr__(self, "value", self.value)
 
 
 @dataclass(
@@ -171,29 +165,10 @@ class WebhookUrl:
             address = ipaddress.ip_address(parsed.hostname)
         except ValueError:
             return
-        if not _ip_is_public(address):
+        if not self._ip_is_public(address):
             raise InvalidWebhookUrl(url=self.value)
 
-
-def _ip_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    # Multicast может иметь is_global=True, поэтому проверяется отдельно.
-    return address.is_global and not address.is_multicast
-
-
-def to_decimal(raw: Any) -> Decimal:
-    """Приводит ввод API (str/int/float) к Decimal; мусор — InvalidMoney.
-
-    Через str(): Decimal(float) сохранил бы двоичное представление
-    (0.1 -> 0.1000...055), а не десятичное 0.1.
-    """
-    try:
-        return Decimal(str(raw))
-    except (
-        InvalidOperation,
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise InvalidMoney(
-            amount=raw,
-            reason="not a valid decimal",
-        ) from exc
+    @staticmethod
+    def _ip_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        # Multicast может иметь is_global=True, поэтому проверяется отдельно.
+        return address.is_global and not address.is_multicast

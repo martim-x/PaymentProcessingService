@@ -22,7 +22,7 @@ from payment.domain.model.value_objects import (
     PaymentId,
     WebhookUrl,
 )
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 from tests.fakes import GatewayResult as FakeGatewayResult
 
 pytestmark = [

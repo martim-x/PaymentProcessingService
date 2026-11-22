@@ -2,23 +2,28 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import PaymentId
 
+
 # Статусы задачи доставки webhook (таблица webhook_deliveries).
-DELIVERY_PENDING = "pending"
-DELIVERY_DELIVERING = "delivering"
-DELIVERY_DELIVERED = "delivered"
-DELIVERY_FAILED = "failed"
+class WebhookDeliveryStatus(StrEnum):
+    PENDING = "pending"
+    DELIVERING = "delivering"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
 
 # Кто публикует запись outbox: relay ('relay') или никто — строка хранится для
 # consumer'а ('local'). Второй режим нужен, чтобы не выдавать запись за
 # отправленную: sent остаётся честным флагом публикации.
-DISPATCH_RELAY = "relay"
-DISPATCH_LOCAL = "local"
+class OutboxDispatch(StrEnum):
+    RELAY = "relay"
+    LOCAL = "local"
 
 
 @dataclass(
@@ -40,7 +45,7 @@ class OutboxRecord:
     attempts: int = 0
     failed: bool = False
     event_type: str = ""
-    dispatch: str = DISPATCH_RELAY
+    dispatch: OutboxDispatch = OutboxDispatch.RELAY
 
 
 @dataclass(
@@ -58,7 +63,7 @@ class WebhookDelivery:
 
     event_id: str
     payment_id: UUID
-    status: str = DELIVERY_PENDING
+    status: WebhookDeliveryStatus = WebhookDeliveryStatus.PENDING
     attempts: int = 0
     last_error: str | None = None
     locked_until: datetime | None = None
@@ -143,7 +148,7 @@ class OutboxRepository(Protocol):
         *,
         payload: dict[str, object],
         aggregate_id: str,
-        dispatch: str = DISPATCH_RELAY,
+        dispatch: OutboxDispatch = OutboxDispatch.RELAY,
     ) -> OutboxRecord:
         """Пишет событие в текущую транзакцию — ту же, что и сам агрегат.
 

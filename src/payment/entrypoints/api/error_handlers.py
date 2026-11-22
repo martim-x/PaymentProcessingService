@@ -22,61 +22,76 @@ from payment.domain.exceptions import (
 )
 
 
-def _json_safe(value: Any) -> Any:
-    """Заменяет non-finite числа строками до JSON-сериализации.
+class ApiErrorHandlers:
+    @classmethod
+    def register(cls, app: FastAPI) -> None:
+        app.exception_handler(RequestValidationError)(cls._request_validation_error)
+        app.exception_handler(PaymentNotFound)(cls._payment_not_found)
+        app.exception_handler(IdempotencyConflict)(cls._idempotency_conflict)
+        app.exception_handler(InvalidStatusTransition)(cls._invalid_transition)
+        app.exception_handler(InvalidMoney)(cls._domain_validation_error)
+        app.exception_handler(InvalidWebhookUrl)(cls._domain_validation_error)
+        app.exception_handler(ApplicationError)(cls._application_error)
 
-    Pydantic кладёт исходный ввод в detail ошибки: Decimal('NaN')/float('nan')
-    не кодируются json.dumps, и клиент вместо 422 получал бы 500.
-    """
-    if isinstance(
-        value,
-        float,
-    ) and not math.isfinite(value):
-        return str(value)
-    if (
-        isinstance(
-            value,
-            Decimal,
-        )
-        and not value.is_finite()
-    ):
-        return str(value)
-    if isinstance(
-        value,
-        dict,
-    ):
-        typed_value = cast(
-            dict[Any, Any],
-            value,
-        )
-        return {str(key): _json_safe(item) for key, item in typed_value.items()}
-    if isinstance(
-        value,
-        (
-            list,
-            tuple,
-        ),
-    ):
-        sequence_value = cast(
-            list[Any] | tuple[Any, ...],
-            value,
-        )
-        return [_json_safe(item) for item in sequence_value]
-    return value
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        """Заменяет non-finite числа строками до JSON-сериализации.
 
+        Pydantic кладёт исходный ввод в detail ошибки: Decimal('NaN')/float('nan')
+        не кодируются json.dumps, и клиент вместо 422 получал бы 500.
+        """
+        if isinstance(
+            value,
+            float,
+        ) and not math.isfinite(value):
+            return str(value)
+        if (
+            isinstance(
+                value,
+                Decimal,
+            )
+            and not value.is_finite()
+        ):
+            return str(value)
+        if isinstance(
+            value,
+            dict,
+        ):
+            typed_value = cast(
+                dict[Any, Any],
+                value,
+            )
+            return {
+                str(key): ApiErrorHandlers._json_safe(item)
+                for key, item in typed_value.items()
+            }
+        if isinstance(
+            value,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            sequence_value = cast(
+                list[Any] | tuple[Any, ...],
+                value,
+            )
+            return [ApiErrorHandlers._json_safe(item) for item in sequence_value]
+        return value
 
-def register_error_handlers(app: FastAPI) -> None:
-    @app.exception_handler(RequestValidationError)
+    @staticmethod
     async def _request_validation_error(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"detail": jsonable_encoder(_json_safe(exc.errors()))},
+            content={
+                "detail": jsonable_encoder(ApiErrorHandlers._json_safe(exc.errors()))
+            },
         )
 
-    @app.exception_handler(PaymentNotFound)
+    @staticmethod
     async def _payment_not_found(
         request: Request,
         exc: PaymentNotFound,
@@ -86,7 +101,7 @@ def register_error_handlers(app: FastAPI) -> None:
             content={"detail": str(exc)},
         )
 
-    @app.exception_handler(IdempotencyConflict)
+    @staticmethod
     async def _idempotency_conflict(
         request: Request,
         exc: IdempotencyConflict,
@@ -96,7 +111,7 @@ def register_error_handlers(app: FastAPI) -> None:
             content={"detail": str(exc)},
         )
 
-    @app.exception_handler(InvalidStatusTransition)
+    @staticmethod
     async def _invalid_transition(
         request: Request,
         exc: InvalidStatusTransition,
@@ -107,8 +122,7 @@ def register_error_handlers(app: FastAPI) -> None:
         )
 
     # ошибки валидации домена — это ошибка клиента, а не сервера
-    @app.exception_handler(InvalidMoney)
-    @app.exception_handler(InvalidWebhookUrl)
+    @staticmethod
     async def _domain_validation_error(
         request: Request,
         exc: DomainError,
@@ -118,7 +132,7 @@ def register_error_handlers(app: FastAPI) -> None:
             content={"detail": str(exc)},
         )
 
-    @app.exception_handler(ApplicationError)
+    @staticmethod
     async def _application_error(
         request: Request,
         exc: ApplicationError,

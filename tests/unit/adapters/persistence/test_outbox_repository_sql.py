@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from payment.adapters.persistence.repositories.outbox import SqlAlchemyOutboxRepository
-from payment.application.ports.repositories import DISPATCH_LOCAL, DISPATCH_RELAY
+from payment.application.ports.repositories import OutboxDispatch
 
 pytestmark = [
     pytest.mark.unit,
@@ -56,7 +56,7 @@ class TestFetchUnsentSql:
         sql = compile_sql(session.statements[-1])
         assert "dispatch" in sql, sql
         params = bind_params(session.statements[-1])
-        assert DISPATCH_RELAY in params.values()
+        assert OutboxDispatch.RELAY.value in params.values()
         assert "outbox.sent IS false" in sql
         assert "outbox.failed IS false" in sql
         assert "FOR UPDATE SKIP LOCKED" in sql
@@ -68,7 +68,7 @@ class TestFetchUnsentSql:
         await repo.fetch_unsent(batch=5)
 
         params = bind_params(session.statements[-1])
-        assert DISPATCH_LOCAL not in params.values()
+        assert OutboxDispatch.LOCAL.value not in params.values()
 
 
 class TestAddSql:
@@ -82,11 +82,11 @@ class TestAddSql:
                 "event_id": "evt-1",
             },
             aggregate_id="p1",
-            dispatch=DISPATCH_LOCAL,
+            dispatch=OutboxDispatch.LOCAL,
         )
 
         params = bind_params(session.statements[-1])
-        assert record.dispatch == DISPATCH_LOCAL
+        assert record.dispatch is OutboxDispatch.LOCAL
         assert record.sent is False
-        assert DISPATCH_LOCAL in params.values()
+        assert OutboxDispatch.LOCAL.value in params.values()
         assert False in params.values()  # sent=False в самом INSERT

@@ -19,11 +19,7 @@ from payment.application.exceptions import (
     WebhookDeliveryExhausted,
     WebhookDeliveryFailed,
 )
-from payment.application.ports.repositories import (
-    DELIVERY_DELIVERED,
-    DELIVERY_DELIVERING,
-    DELIVERY_PENDING,
-)
+from payment.application.ports.repositories import WebhookDeliveryStatus
 from payment.application.services.webhook_service import WebhookService
 from tests.fakes import FakeUnitOfWork, FakeWebhookSender
 
@@ -135,7 +131,7 @@ class TestTwoCompetingOwners:
         assert sender_a.calls == 1 and sender_b.calls == 1
         record = await uow.webhook_deliveries.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_DELIVERED
+        assert record.status == WebhookDeliveryStatus.DELIVERED
         assert uow.webhook_deliveries.delivered == [EVENT_ID]
 
     async def test_stale_owner_failure_does_not_count_attempt(self) -> None:
@@ -163,7 +159,7 @@ class TestTwoCompetingOwners:
 
         record = await uow.webhook_deliveries.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_DELIVERED
+        assert record.status == WebhookDeliveryStatus.DELIVERED
         assert record.attempts == 0
         assert record.last_error is None
 
@@ -198,7 +194,7 @@ class TestStaleFencing:
 
         record = await repo.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_DELIVERING
+        assert record.status == WebhookDeliveryStatus.DELIVERING
         assert record.locked_until == token_b  # состояние нового владельца цело
 
     async def test_stale_mark_failed_is_rejected(self) -> None:
@@ -262,7 +258,7 @@ class TestStaleFencing:
 
         assert repo.held_claim(event_id=EVENT_ID) == token_b
         record = await repo.get(event_id=EVENT_ID)
-        assert record is not None and record.status == DELIVERY_DELIVERING
+        assert record is not None and record.status == WebhookDeliveryStatus.DELIVERING
 
 
 class TestCrashRecovery:
@@ -290,12 +286,12 @@ class TestCrashRecovery:
             sender,
         ).deliver(command=command())
 
-        assert result.status == DELIVERY_DELIVERED
+        assert result.status == WebhookDeliveryStatus.DELIVERED
         assert sender.calls == 1
         record = await repo.get(event_id=EVENT_ID)
         assert record is not None
         assert record.attempts == 0  # WebhookBusy не считался попыткой
-        assert record.status == DELIVERY_DELIVERED
+        assert record.status == WebhookDeliveryStatus.DELIVERED
 
     async def test_retry_before_lease_expiry_is_busy_not_dead(self) -> None:
         """Ранний дубликат при живом клейме не должен становиться terminal-ошибкой."""
@@ -319,7 +315,7 @@ class TestCrashRecovery:
 
         record = await repo.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_DELIVERING
+        assert record.status == WebhookDeliveryStatus.DELIVERING
         assert record.attempts == 0
 
     async def test_repeated_busy_never_exhausts_attempts(self) -> None:
@@ -346,7 +342,7 @@ class TestCrashRecovery:
 
         record = await repo.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_DELIVERING
+        assert record.status == WebhookDeliveryStatus.DELIVERING
         assert record.attempts == 0
 
 
@@ -383,7 +379,7 @@ class TestCancellation:
 
         record = await repo.get(event_id=EVENT_ID)
         assert record is not None
-        assert record.status == DELIVERY_PENDING  # клейм снят, не ждём TTL
+        assert record.status == WebhookDeliveryStatus.PENDING  # клейм снят, не ждём TTL
         assert repo.held_claim(event_id=EVENT_ID) is None
         assert record.attempts == 0  # отмена — не неудачная доставка
 
@@ -418,7 +414,7 @@ class TestCancellation:
             sender,
         ).deliver(command=command())
 
-        assert result.status == DELIVERY_DELIVERED
+        assert result.status == WebhookDeliveryStatus.DELIVERED
         assert sender.calls == 1
 
 

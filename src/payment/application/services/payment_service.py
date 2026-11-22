@@ -8,7 +8,6 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, cast
 
 from payment.application.dto import (
@@ -18,6 +17,7 @@ from payment.application.dto import (
     ProcessPaymentResult,
     WebhookDeliveryCommand,
 )
+from payment.application.event_types import OutboxEventType
 from payment.application.exceptions import (
     IdempotencyConflict,
     IdempotencyViolation,
@@ -25,67 +25,15 @@ from payment.application.exceptions import (
     PaymentNotFound,
 )
 from payment.application.ports.payment_gateway import GatewayResult, PaymentGateway
-from payment.application.ports.repositories import DISPATCH_LOCAL
+from payment.application.ports.repositories import OutboxDispatch
 from payment.application.ports.unit_of_work import AbstractUnitOfWork
 from payment.domain.events import PaymentCreated
 from payment.domain.model.enums import PaymentStatus
-from payment.domain.model.fingerprint import compute_fingerprint
+from payment.domain.model.fingerprint import PaymentFingerprint
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import Money, PaymentId, WebhookUrl
 
 logger = logging.getLogger(__name__)
-WEBHOOK_EVENT = "payment.webhook"
-
-
-def canonical_amount(amount: Decimal) -> str:
-    """Каноническая запись Decimal для fingerprint идемпотентности."""
-    return format(
-        amount.normalize(),
-        "f",
-    )
-
-
-def _outbox_payload(event: PaymentCreated) -> dict[str, object]:
-    return {
-        "event": "payment.created",
-        "payment_id": str(event.payment_id),
-    }
-
-
-def build_webhook_body(
-    payment: Payment,
-    event_id: str,
-) -> dict[str, Any]:
-    """Собирает компактное тело уведомления со стабильным event_id."""
-    return {
-        "id": str(payment.id),
-        "event": f"payment.{payment.status.value}",
-        "event_id": event_id,
-        "status": payment.status.value,
-        "amount": str(payment.amount.amount),
-        "currency": payment.amount.currency.value,
-        "failure_reason": payment.failure_reason,
-        "processed_at": (
-            payment.processed_at.isoformat() if payment.processed_at else None
-        ),
-    }
-
-
-def build_webhook_event(
-    payment: Payment,
-    event_id: str,
-) -> dict[str, Any]:
-    """Создаёт payload уведомления, доставляемого обработчиком платежа."""
-    return {
-        "event": WEBHOOK_EVENT,
-        "event_id": event_id,
-        "payment_id": str(payment.id),
-        "webhook_url": payment.webhook_url.value,
-        "body": build_webhook_body(
-            payment,
-            event_id,
-        ),
-    }
 
 
 class PaymentService:
@@ -113,15 +61,48 @@ class PaymentService:
 
     @staticmethod
     def _fingerprint(*, command: CreatePaymentCommand) -> str:
-        return compute_fingerprint(
-            {
-                "amount": canonical_amount(command.amount),
+        return PaymentFingerprint.compute(
+            payload={
+                "amount": PaymentFingerprint.canonical_amount(amount=command.amount),
                 "currency": command.currency.value,
                 "description": command.description,
                 "metadata": dict(command.metadata),
                 "webhook_url": command.webhook_url,
             }
         )
+
+    @staticmethod
+    def _outbox_payload(*, event: PaymentCreated) -> dict[str, object]:
+        return {
+            "event": OutboxEventType.PAYMENT_CREATED.value,
+            "payment_id": str(event.payment_id),
+        }
+
+    @staticmethod
+    def _build_webhook_body(*, payment: Payment, event_id: str) -> dict[str, Any]:
+        return {
+            "id": str(payment.id),
+            "event": f"payment.{payment.status.value}",
+            "event_id": event_id,
+            "status": payment.status.value,
+            "amount": str(payment.amount.amount),
+            "currency": payment.amount.currency.value,
+            "failure_reason": payment.failure_reason,
+            "processed_at": (
+                payment.processed_at.isoformat() if payment.processed_at else None
+            ),
+        }
+
+    def _build_webhook_event(
+        self, *, payment: Payment, event_id: str
+    ) -> dict[str, Any]:
+        return {
+            "event": OutboxEventType.PAYMENT_WEBHOOK.value,
+            "event_id": event_id,
+            "payment_id": str(payment.id),
+            "webhook_url": payment.webhook_url.value,
+            "body": self._build_webhook_body(payment=payment, event_id=event_id),
+        }
 
     async def create_payment(
         self,
@@ -175,7 +156,7 @@ class PaymentService:
                     PaymentCreated,
                 ):
                     await uow.outbox.add(
-                        payload=_outbox_payload(event),
+                        payload=self._outbox_payload(event=event),
                         aggregate_id=str(payment.id),
                     )
             await uow.commit()
@@ -278,10 +259,7 @@ class PaymentService:
             return await self._resume_result(payment=actual)
         return self._result(
             payment=payment,
-            event=build_webhook_event(
-                payment,
-                event_id,
-            ),
+            event=self._build_webhook_event(payment=payment, event_id=event_id),
         )
 
     async def _acquire_claim(
@@ -378,12 +356,11 @@ class PaymentService:
                 # публиковать её нельзя: dispatch='local' прямо говорит, что
                 # relay эту запись не читает, а sent остаётся false.
                 await uow.outbox.add(
-                    payload=build_webhook_event(
-                        payment,
-                        event_id,
+                    payload=self._build_webhook_event(
+                        payment=payment, event_id=event_id
                     ),
                     aggregate_id=str(payment.id),
-                    dispatch=DISPATCH_LOCAL,
+                    dispatch=OutboxDispatch.LOCAL,
                 )
             await uow.commit()
         return won
@@ -396,7 +373,7 @@ class PaymentService:
         async with self._uow as uow:
             record = await uow.outbox.find_event(
                 aggregate_id=str(payment.id),
-                event_type=WEBHOOK_EVENT,
+                event_type=OutboxEventType.PAYMENT_WEBHOOK.value,
             )
         return self._result(
             payment=payment,

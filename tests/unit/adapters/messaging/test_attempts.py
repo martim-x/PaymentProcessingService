@@ -3,12 +3,11 @@
 import pytest
 
 from payment.adapters.messaging.routing import (
-    ATTEMPT_HEADER,
-    next_attempt,
-    route_failure,
+    BrokerRetryHeader,
+    FailureRouter,
 )
-from payment.adapters.messaging.topology import infra_retry_queue_name, retry_queue_name
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
+from payment.adapters.messaging.topology import RabbitTopology
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 
 pytestmark = [
     pytest.mark.unit,
@@ -18,15 +17,15 @@ pytestmark = [
 
 class TestNextAttempt:
     def test_first_delivery_is_attempt_one(self) -> None:
-        assert next_attempt({}) == 1
+        assert FailureRouter.next_attempt({}) == 1
 
     def test_own_header_increments(self) -> None:
-        assert next_attempt({ATTEMPT_HEADER: 1}) == 2
-        assert next_attempt({ATTEMPT_HEADER: 2}) == 3
+        assert FailureRouter.next_attempt({BrokerRetryHeader.ATTEMPT: 1}) == 2
+        assert FailureRouter.next_attempt({BrokerRetryHeader.ATTEMPT: 2}) == 3
 
     def test_own_header_has_priority_over_x_death(self) -> None:
         headers = {
-            ATTEMPT_HEADER: 2,
+            BrokerRetryHeader.ATTEMPT: 2,
             "x-death": [
                 {
                     "queue": "payments.new.retry.1",
@@ -35,7 +34,7 @@ class TestNextAttempt:
             ],
         }
 
-        assert next_attempt(headers) == 3
+        assert FailureRouter.next_attempt(headers) == 3
 
     def test_x_death_fallback_still_works(self) -> None:
         headers = {
@@ -47,20 +46,20 @@ class TestNextAttempt:
             ]
         }
 
-        assert next_attempt(headers) == 2
+        assert FailureRouter.next_attempt(headers) == 2
 
     def test_x_death_fallback_ignores_infra_retry_queues(self) -> None:
         headers = {
             "x-death": [
                 {
-                    "queue": infra_retry_queue_name(
+                    "queue": RabbitTopology.infra_retry_queue_name(
                         "payments.new",
                         1,
                     ),
                     "count": 4,
                 },
                 {
-                    "queue": retry_queue_name(
+                    "queue": RabbitTopology.retry_queue_name(
                         "payments.new",
                         1,
                     ),
@@ -69,21 +68,21 @@ class TestNextAttempt:
             ]
         }
 
-        assert next_attempt(headers) == 2
+        assert FailureRouter.next_attempt(headers) == 2
 
     def test_x_death_fallback_respects_custom_queue_names(self) -> None:
         queue_name = "payments.infra.retry.orders"
         headers = {
             "x-death": [
                 {
-                    "queue": infra_retry_queue_name(
+                    "queue": RabbitTopology.infra_retry_queue_name(
                         queue_name,
                         1,
                     ),
                     "count": 4,
                 },
                 {
-                    "queue": retry_queue_name(
+                    "queue": RabbitTopology.retry_queue_name(
                         queue_name,
                         1,
                     ),
@@ -93,20 +92,20 @@ class TestNextAttempt:
         }
 
         assert (
-            next_attempt(
+            FailureRouter.next_attempt(
                 headers,
                 queue_name=queue_name,
             )
             == 2
         )
-        decision = route_failure(
+        decision = FailureRouter.route_failure(
             headers,
             ExponentialBackoffRetryPolicy(max_attempts=3),
             queue_name=queue_name,
             dlq_name="payments.dlq",
         )
         assert decision.attempt == 2
-        assert decision.queue == retry_queue_name(
+        assert decision.queue == RabbitTopology.retry_queue_name(
             queue_name,
             2,
         )
@@ -121,18 +120,20 @@ class TestNextAttempt:
             ]
         }
 
-        assert next_attempt(headers) == 1
+        assert FailureRouter.next_attempt(headers) == 1
 
     def test_broken_header_value_resets_to_first_attempt(self) -> None:
-        assert next_attempt({ATTEMPT_HEADER: "not-a-number"}) == 1
+        assert (
+            FailureRouter.next_attempt({BrokerRetryHeader.ATTEMPT: "not-a-number"}) == 1
+        )
 
 
 class TestDecideFailure:
     def test_retry_targets_numbered_queue(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=3)
 
-        decision = route_failure(
-            {ATTEMPT_HEADER: 1},
+        decision = FailureRouter.route_failure(
+            {BrokerRetryHeader.ATTEMPT: 1},
             policy,
             queue_name="payments.new",
             dlq_name="payments.dlq",
@@ -145,8 +146,8 @@ class TestDecideFailure:
     def test_last_attempt_goes_to_dlq(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=3)
 
-        decision = route_failure(
-            {ATTEMPT_HEADER: 2},
+        decision = FailureRouter.route_failure(
+            {BrokerRetryHeader.ATTEMPT: 2},
             policy,
             queue_name="payments.new",
             dlq_name="custom.dlq",
@@ -161,7 +162,7 @@ class TestDecideFailure:
         headers: dict[str, int] = {}
         decisions = []
         for _ in range(3):
-            decision = route_failure(
+            decision = FailureRouter.route_failure(
                 headers,
                 policy,
                 queue_name="payments.new",
@@ -169,7 +170,7 @@ class TestDecideFailure:
             )
             decisions.append(decision)
             if decision.action == "retry":
-                headers[ATTEMPT_HEADER] = decision.attempt
+                headers[BrokerRetryHeader.ATTEMPT] = decision.attempt
         assert [decision.action for decision in decisions] == [
             "retry",
             "retry",
@@ -191,11 +192,11 @@ class TestRetryChainReachesDlq:
         attempts = []
 
         for _ in range(10):  # имитируем бесконечную доставку сбоящего сообщения
-            attempt = next_attempt(headers)
+            attempt = FailureRouter.next_attempt(headers)
             attempts.append(attempt)
             if policy.is_exhausted(attempts=attempt):
                 break
-            headers = {ATTEMPT_HEADER: attempt}
+            headers = {BrokerRetryHeader.ATTEMPT: attempt}
 
         assert attempts == [
             1,
@@ -206,7 +207,7 @@ class TestRetryChainReachesDlq:
     def test_custom_queue_names_are_respected(self) -> None:
         policy = ExponentialBackoffRetryPolicy(max_attempts=2)
 
-        decision = route_failure(
+        decision = FailureRouter.route_failure(
             {},
             policy,
             queue_name="orders.new",

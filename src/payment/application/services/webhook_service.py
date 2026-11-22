@@ -12,9 +12,8 @@ from payment.application.exceptions import (
     WebhookDeliveryFailed,
 )
 from payment.application.ports.repositories import (
-    DELIVERY_DELIVERED,
-    DELIVERY_FAILED,
     WebhookDelivery,
+    WebhookDeliveryStatus,
 )
 from payment.application.ports.unit_of_work import AbstractUnitOfWork
 from payment.application.ports.webhook_sender import WebhookSender
@@ -31,7 +30,7 @@ class WebhookDeliveryResult:
     """Состояние доставки webhook после обработки события."""
 
     event_id: str
-    status: str
+    status: WebhookDeliveryStatus
     already_delivered: bool = False
     stale: bool = False
 
@@ -106,12 +105,12 @@ class WebhookService:
             )
             return WebhookDeliveryResult(
                 event_id=command.event_id,
-                status="delivering",
+                status=WebhookDeliveryStatus.DELIVERING,
                 stale=True,
             )
         return WebhookDeliveryResult(
             event_id=command.event_id,
-            status=DELIVERY_DELIVERED,
+            status=WebhookDeliveryStatus.DELIVERED,
         )
 
     async def _result_without_claim(
@@ -120,13 +119,13 @@ class WebhookService:
         command: WebhookDeliveryCommand,
     ) -> WebhookDeliveryResult:
         record = await self._get(event_id=command.event_id)
-        if record is not None and record.status == DELIVERY_DELIVERED:
+        if record is not None and record.status == WebhookDeliveryStatus.DELIVERED:
             return WebhookDeliveryResult(
                 event_id=command.event_id,
                 status=record.status,
                 already_delivered=True,
             )
-        if record is not None and record.status == DELIVERY_FAILED:
+        if record is not None and record.status == WebhookDeliveryStatus.FAILED:
             raise WebhookDeliveryExhausted(
                 event_id=command.event_id,
                 attempts=record.attempts,

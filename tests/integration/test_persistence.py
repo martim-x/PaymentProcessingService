@@ -209,6 +209,28 @@ class TestUnitOfWork:
             loaded = await w.payments.get(payment_id=payment.id)
         assert loaded is None
 
+    async def test_exception_rolls_back_payment_and_outbox_without_masking(
+        self,
+        uow_factory,
+    ) -> None:
+        uow = uow_factory()
+        payment = make_payment("key-int-exception-rollback")
+        with pytest.raises(RuntimeError, match="sentinel failure"):
+            async with uow as w:
+                await w.payments.add(payment=payment)
+                await w.outbox.add(
+                    payload={"event": "payment.created"},
+                    aggregate_id=str(payment.id),
+                )
+                raise RuntimeError("sentinel failure")
+
+        uow2 = uow_factory()
+        async with uow2 as w:
+            loaded = await w.payments.get(payment_id=payment.id)
+            outbox = await w.outbox.fetch_unsent(batch=10)
+        assert loaded is None
+        assert outbox == []
+
 
 class TestProcessPaymentPersistStatus:
     """Регрессия: статус должен реально обновляться в БД и не перезаписываться дважды."""

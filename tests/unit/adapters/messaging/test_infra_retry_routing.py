@@ -18,8 +18,9 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from payment.adapters.messaging.routing import ATTEMPT_HEADER, INFRA_ATTEMPT_HEADER
-from payment.adapters.messaging.topology import declare_topology, infra_retry_queue_name
+from payment.adapters.messaging.redelivery import MessageRedeliverer
+from payment.adapters.messaging.routing import BrokerRetryHeader, FailureRouter
+from payment.adapters.messaging.topology import RabbitTopology
 from payment.application.dto import (
     CreatePaymentCommand,
     ProcessPaymentResult,
@@ -33,8 +34,8 @@ from payment.application.exceptions import (
 from payment.config import Settings
 from payment.domain.model.enums import Currency
 from payment.domain.model.value_objects import IdempotencyKey
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
-from payment.entrypoints.consumer.app import handle_payment_created
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
+from payment.entrypoints.consumer.app import PaymentConsumer
 
 pytestmark = [
     pytest.mark.unit,
@@ -209,20 +210,10 @@ async def consume(
         headers=headers,
     )
     broker = FakeBroker()
-    await handle_payment_created(
-        cast(
-            Any,
-            message,
-        ),
-        broker=cast(
-            Any,
-            broker,
-        ),
-        container=cast(
-            Any,
-            container,
-        ),
-    )
+    await PaymentConsumer(
+        broker=cast(Any, broker),
+        container=cast(Any, container),
+    ).handle_payment_created(cast(Any, message))
     return message, broker
 
 
@@ -239,16 +230,16 @@ class TestInfraRouting:
         message, broker = await consume(
             container,
             headers={
-                ATTEMPT_HEADER: 2,
-                INFRA_ATTEMPT_HEADER: 3,
+                BrokerRetryHeader.ATTEMPT: 2,
+                BrokerRetryHeader.INFRA_ATTEMPT: 3,
             },
         )
 
         assert message.acked is True
         assert broker.last["queue"] == f"{QUEUE}.retry.2"
         assert broker.last["headers"] == {
-            ATTEMPT_HEADER: 2,
-            INFRA_ATTEMPT_HEADER: 3,
+            BrokerRetryHeader.ATTEMPT: 2,
+            BrokerRetryHeader.INFRA_ATTEMPT: 3,
         }
 
     async def test_operational_error_uses_its_own_retry_chain(self) -> None:
@@ -266,13 +257,13 @@ class TestInfraRouting:
         message, broker = await consume(container)
 
         assert message.acked is True
-        assert broker.last["queue"] == infra_retry_queue_name(
+        assert broker.last["queue"] == RabbitTopology.infra_retry_queue_name(
             QUEUE,
             1,
         )
-        assert broker.last["headers"] == {INFRA_ATTEMPT_HEADER: 1}
+        assert broker.last["headers"] == {BrokerRetryHeader.INFRA_ATTEMPT: 1}
         assert (
-            ATTEMPT_HEADER not in broker.last["headers"]
+            BrokerRetryHeader.ATTEMPT not in broker.last["headers"]
         )  # business-счётчик не тронут
 
     async def test_infra_delay_step_uses_its_own_counter(self) -> None:
@@ -290,18 +281,18 @@ class TestInfraRouting:
         _, broker = await consume(
             container,
             headers={
-                ATTEMPT_HEADER: 2,
-                INFRA_ATTEMPT_HEADER: 1,
+                BrokerRetryHeader.ATTEMPT: 2,
+                BrokerRetryHeader.INFRA_ATTEMPT: 1,
             },
         )
 
-        assert broker.last["queue"] == infra_retry_queue_name(
+        assert broker.last["queue"] == RabbitTopology.infra_retry_queue_name(
             QUEUE,
             2,
         )
         assert broker.last["headers"] == {
-            ATTEMPT_HEADER: 2,
-            INFRA_ATTEMPT_HEADER: 2,
+            BrokerRetryHeader.ATTEMPT: 2,
+            BrokerRetryHeader.INFRA_ATTEMPT: 2,
         }
 
     async def test_business_failure_shares_the_budget_with_infra_failures(self) -> None:
@@ -313,8 +304,8 @@ class TestInfraRouting:
         _, broker = await consume(
             container,
             headers={
-                ATTEMPT_HEADER: 1,
-                INFRA_ATTEMPT_HEADER: 1,
+                BrokerRetryHeader.ATTEMPT: 1,
+                BrokerRetryHeader.INFRA_ATTEMPT: 1,
             },
         )
 
@@ -331,15 +322,15 @@ class TestInfraRouting:
         _, broker = await consume(
             container,
             headers={
-                ATTEMPT_HEADER: 1,
-                INFRA_ATTEMPT_HEADER: 0,
+                BrokerRetryHeader.ATTEMPT: 1,
+                BrokerRetryHeader.INFRA_ATTEMPT: 0,
             },
         )
 
         assert broker.last["queue"] == f"{QUEUE}.retry.2"
         assert broker.last["headers"] == {
-            ATTEMPT_HEADER: 2,
-            INFRA_ATTEMPT_HEADER: 0,
+            BrokerRetryHeader.ATTEMPT: 2,
+            BrokerRetryHeader.INFRA_ATTEMPT: 0,
         }
 
     async def test_infra_exhaustion_sends_message_to_the_durable_dlq(
@@ -364,7 +355,7 @@ class TestInfraRouting:
         ):
             message, broker = await consume(
                 container,
-                headers={INFRA_ATTEMPT_HEADER: cfg.max_attempts - 1},
+                headers={BrokerRetryHeader.INFRA_ATTEMPT: cfg.max_attempts - 1},
             )
 
         assert message.acked is True
@@ -386,7 +377,7 @@ class TestInfraRouting:
 
         assert message.acked is True
         assert broker.last["queue"] == f"{QUEUE}.retry.1"
-        assert broker.last["headers"] == {ATTEMPT_HEADER: 0}
+        assert broker.last["headers"] == {BrokerRetryHeader.ATTEMPT: 0}
 
     async def test_payment_busy_does_not_spend_business_attempt(self) -> None:
         container = FakeContainer(
@@ -398,12 +389,12 @@ class TestInfraRouting:
 
         message, broker = await consume(
             container,
-            headers={ATTEMPT_HEADER: 2},
+            headers={BrokerRetryHeader.ATTEMPT: 2},
         )
 
         assert message.acked is True
         assert broker.last["queue"] == f"{QUEUE}.retry.2"
-        assert broker.last["headers"] == {ATTEMPT_HEADER: 2}
+        assert broker.last["headers"] == {BrokerRetryHeader.ATTEMPT: 2}
 
     async def test_unknown_error_is_bounded_by_the_payment_chain(self) -> None:
         container = FakeContainer(
@@ -414,8 +405,8 @@ class TestInfraRouting:
         _, broker = await consume(container)
 
         assert broker.last["queue"] == f"{QUEUE}.retry.1"
-        assert broker.last["headers"] == {ATTEMPT_HEADER: 1}
-        assert INFRA_ATTEMPT_HEADER not in broker.last["headers"]
+        assert broker.last["headers"] == {BrokerRetryHeader.ATTEMPT: 1}
+        assert BrokerRetryHeader.INFRA_ATTEMPT not in broker.last["headers"]
 
     async def test_not_found_is_not_retried_as_infrastructure(self) -> None:
         container = FakeContainer(
@@ -428,7 +419,7 @@ class TestInfraRouting:
         _, broker = await consume(container)
 
         assert broker.last["queue"] == f"{QUEUE}.retry.1"
-        assert broker.last["headers"] == {ATTEMPT_HEADER: 1}
+        assert broker.last["headers"] == {BrokerRetryHeader.ATTEMPT: 1}
 
     async def test_missing_webhook_payload_is_retried_not_acked(self) -> None:
         container = FakeContainer(
@@ -440,7 +431,7 @@ class TestInfraRouting:
 
         assert message.acked is True  # original transferred only after retry publish
         assert broker.last["queue"] == f"{QUEUE}.retry.1"
-        assert broker.last["headers"] == {ATTEMPT_HEADER: 1}
+        assert broker.last["headers"] == {BrokerRetryHeader.ATTEMPT: 1}
         assert container.webhook_service().commands == []
 
     async def test_success_acks_without_redelivery(self) -> None:
@@ -478,12 +469,6 @@ class TestInfraRouting:
 class TestFailureChain:
     async def test_alternating_failures_share_one_budget(self) -> None:
         """business → infra → business: счётчики переносятся, третий отказ — DLQ."""
-        from payment.adapters.messaging.redelivery import publish_failure
-        from payment.adapters.messaging.routing import (
-            route_failure,
-            route_infra_failure,
-        )
-
         policy = ExponentialBackoffRetryPolicy(
             max_attempts=3,
             base_delay=1.0,
@@ -492,9 +477,9 @@ class TestFailureChain:
         actions: list[str] = []
 
         for route in (
-            route_failure,
-            route_infra_failure,
-            route_failure,
+            FailureRouter.route_failure,
+            FailureRouter.route_infra_failure,
+            FailureRouter.route_failure,
         ):
             message = FakeMessage(
                 body=json.dumps(body()).encode(),
@@ -507,17 +492,17 @@ class TestFailureChain:
                 queue_name=QUEUE,
                 dlq_name=DLQ,
             )
-            await publish_failure(
-                cast(
+            await MessageRedeliverer.publish_failure(
+                broker=cast(
                     Any,
                     broker,
                 ),
-                cast(
+                message=cast(
                     Any,
                     message,
                 ),
-                body(),
-                decision,
+                payload=body(),
+                decision=decision,
             )  # type: ignore[arg-type]
             actions.append(decision.action)
             if decision.action == "dlq":
@@ -588,20 +573,10 @@ class TestConsumerRedelivery:
             ).encode()
         )
         broker = FakeBroker()
-        await handle_payment_created(
-            cast(
-                Any,
-                first,
-            ),
-            broker=cast(
-                Any,
-                broker,
-            ),
-            container=cast(
-                Any,
-                container,
-            ),
-        )  # type: ignore[arg-type]
+        await PaymentConsumer(
+            broker=cast(Any, broker),
+            container=cast(Any, container),
+        ).handle_payment_created(cast(Any, first))
 
         assert first.acked is True
         assert broker.last["queue"] == f"{QUEUE}.retry.1"
@@ -618,20 +593,10 @@ class TestConsumerRedelivery:
             headers=broker.last["headers"],
         )
         retry_broker = FakeBroker()
-        await handle_payment_created(
-            cast(
-                Any,
-                second,
-            ),
-            broker=cast(
-                Any,
-                retry_broker,
-            ),
-            container=cast(
-                Any,
-                container,
-            ),
-        )  # type: ignore[arg-type]
+        await PaymentConsumer(
+            broker=cast(Any, retry_broker),
+            container=cast(Any, container),
+        ).handle_payment_created(cast(Any, second))
 
         assert second.acked is True
         assert retry_broker.published == []  # повтор не породил новое сообщение
@@ -661,7 +626,7 @@ class TestTopologyDeclaration:
             factor=cfg.retry_factor,
         )
 
-        await declare_topology(
+        await RabbitTopology.declare_topology(
             broker,  # type: ignore[arg-type]
             fast,
             QUEUE,
@@ -673,7 +638,7 @@ class TestTopologyDeclaration:
             name for name in broker.declared if name.startswith(f"{INFRA_QUEUE}.")
         )
         assert infra_names == [
-            infra_retry_queue_name(
+            RabbitTopology.infra_retry_queue_name(
                 QUEUE,
                 attempt,
             )
@@ -683,13 +648,13 @@ class TestTopologyDeclaration:
             )
         ]
         first = broker.declared[
-            infra_retry_queue_name(
+            RabbitTopology.infra_retry_queue_name(
                 QUEUE,
                 1,
             )
         ]
         second = broker.declared[
-            infra_retry_queue_name(
+            RabbitTopology.infra_retry_queue_name(
                 QUEUE,
                 2,
             )
@@ -707,7 +672,7 @@ class TestTopologyDeclaration:
         cfg = settings()
         broker = self.RecordingBroker()
 
-        await declare_topology(
+        await RabbitTopology.declare_topology(
             broker,  # type: ignore[arg-type]
             cfg.infra_retry_policy,
             QUEUE,
@@ -754,7 +719,7 @@ class TestRoutingPolicyUnit:
                 0,
                 "infra",
                 "retry",
-                infra_retry_queue_name(
+                RabbitTopology.infra_retry_queue_name(
                     QUEUE,
                     1,
                 ),
@@ -783,20 +748,19 @@ class TestRoutingPolicyUnit:
         expected_action,
         expected_queue,
     ) -> None:
-        from payment.adapters.messaging.routing import (
-            route_failure,
-            route_infra_failure,
-        )
-
         policy = ExponentialBackoffRetryPolicy(
             max_attempts=3,
             base_delay=2.0,
         )
         headers = {
-            ATTEMPT_HEADER: business,
-            INFRA_ATTEMPT_HEADER: infra,
+            BrokerRetryHeader.ATTEMPT: business,
+            BrokerRetryHeader.INFRA_ATTEMPT: infra,
         }
-        route = route_failure if failure == "business" else route_infra_failure
+        route = (
+            FailureRouter.route_failure
+            if failure == "business"
+            else FailureRouter.route_infra_failure
+        )
 
         decision = route(
             headers,
@@ -812,10 +776,8 @@ class TestRoutingPolicyUnit:
         assert decision.header_value == own + 1
 
     def test_infra_attempt_header_is_separate(self) -> None:
-        from payment.adapters.messaging.routing import route_infra_failure
-
-        decision = route_infra_failure(
-            {ATTEMPT_HEADER: 2},
+        decision = FailureRouter.route_infra_failure(
+            {BrokerRetryHeader.ATTEMPT: 2},
             ExponentialBackoffRetryPolicy(
                 max_attempts=5,
                 base_delay=2.0,
@@ -828,11 +790,11 @@ class TestRoutingPolicyUnit:
         # бюджет считает оба класса отказов, а ступень задержки — только инфраструктурные
         assert decision.attempt == 3
         assert decision.header_value == 1
-        assert decision.queue == infra_retry_queue_name(
+        assert decision.queue == RabbitTopology.infra_retry_queue_name(
             QUEUE,
             1,
         )
-        assert decision.header == INFRA_ATTEMPT_HEADER
+        assert decision.header == BrokerRetryHeader.INFRA_ATTEMPT
 
     @pytest.mark.parametrize(
         "header_value",
@@ -845,33 +807,29 @@ class TestRoutingPolicyUnit:
         self,
         header_value: int,
     ) -> None:
-        from payment.adapters.messaging.routing import route_infra_failure
-
         policy = ExponentialBackoffRetryPolicy(
             max_attempts=4,
             base_delay=2.0,
         )
-        decision = route_infra_failure(
-            {INFRA_ATTEMPT_HEADER: header_value},
+        decision = FailureRouter.route_infra_failure(
+            {BrokerRetryHeader.INFRA_ATTEMPT: header_value},
             policy,
             queue_name=QUEUE,
             dlq_name=DLQ,
         )
 
-        assert decision.queue == infra_retry_queue_name(
+        assert decision.queue == RabbitTopology.infra_retry_queue_name(
             QUEUE,
             header_value + 1,
         )
         assert decision.action == "retry"
-        assert decision.header == INFRA_ATTEMPT_HEADER
+        assert decision.header == BrokerRetryHeader.INFRA_ATTEMPT
         assert decision.header_value == header_value + 1
 
     def test_busy_clamps_to_the_last_retry_queue(self) -> None:
         """Занятое сообщение откладывается по последней ступени и не тратит бюджет."""
-        from payment.adapters.messaging.routing import route_busy
-
-        decision = route_busy(
-            {ATTEMPT_HEADER: 9},
+        decision = FailureRouter.route_busy(
+            {BrokerRetryHeader.ATTEMPT: 9},
             ExponentialBackoffRetryPolicy(
                 max_attempts=3,
                 base_delay=1.0,
@@ -884,14 +842,12 @@ class TestRoutingPolicyUnit:
         assert decision.header_value == 9
 
     def test_total_failures_reach_dlq_at_the_shared_limit(self) -> None:
-        from payment.adapters.messaging.routing import route_infra_failure
-
         policy = ExponentialBackoffRetryPolicy(
             max_attempts=4,
             base_delay=2.0,
         )
-        decision = route_infra_failure(
-            {INFRA_ATTEMPT_HEADER: 3},
+        decision = FailureRouter.route_infra_failure(
+            {BrokerRetryHeader.INFRA_ATTEMPT: 3},
             policy,
             queue_name=QUEUE,
             dlq_name=DLQ,

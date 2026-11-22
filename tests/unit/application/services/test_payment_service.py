@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 
 from payment.application.dto import CreatePaymentCommand, PaymentDetails
+from payment.application.event_types import OutboxEventType
 from payment.application.exceptions import PaymentNotFound
 from payment.application.services.payment_service import PaymentService
 from payment.domain.model.enums import Currency
@@ -71,4 +72,7 @@ class TestPaymentService:
         assert result.status == "succeeded"
         assert gateway.calls == 1
         events = [record.payload for record in uow.outbox.all_records()]
-        assert any(event.get("event") == "payment.webhook" for event in events)
+        assert any(
+            event.get("event") == OutboxEventType.PAYMENT_WEBHOOK.value
+            for event in events
+        )

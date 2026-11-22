@@ -5,15 +5,16 @@ from decimal import Decimal
 import pytest
 
 from payment.application.dto import CreatePaymentCommand
+from payment.application.event_types import OutboxEventType
 from payment.application.exceptions import (
     IdempotencyConflict,
     PaymentBusy,
     PaymentNotFound,
 )
 from payment.application.ports.payment_gateway import PaymentGateway
-from payment.application.ports.repositories import DISPATCH_LOCAL
+from payment.application.ports.repositories import OutboxDispatch
 from payment.application.services.outbox_service import OutboxService
-from payment.application.services.payment_service import WEBHOOK_EVENT, PaymentService
+from payment.application.services.payment_service import PaymentService
 from payment.domain.model.enums import Currency, PaymentStatus
 from payment.domain.model.payment import Payment
 from payment.domain.model.value_objects import (
@@ -52,7 +53,7 @@ def webhook_events(uow: FakeUnitOfWork) -> list[dict]:
     return [
         r.payload
         for r in uow.outbox.all_records()
-        if r.payload.get("event") == WEBHOOK_EVENT
+        if r.payload.get("event") == OutboxEventType.PAYMENT_WEBHOOK.value
     ]
 
 
@@ -92,7 +93,7 @@ class TestCreatePayment:
         assert len(uow.outbox.all_records()) == 1
         record = uow.outbox.all_records()[0]
         assert record.payload["payment_id"] == str(result.payment.id.value)
-        assert record.payload["event"] == "payment.created"
+        assert record.payload["event"] == OutboxEventType.PAYMENT_CREATED.value
         assert record.aggregate_id == str(result.payment.id.value)
         assert uow.committed == 1
 
@@ -219,9 +220,13 @@ class TestPaymentServiceProcessing:
 
         await payment_service.process_payment(payment_id=created.payment.id)
 
-        stored = [r for r in uow.outbox.all_records() if r.event_type == WEBHOOK_EVENT]
+        stored = [
+            r
+            for r in uow.outbox.all_records()
+            if r.event_type == OutboxEventType.PAYMENT_WEBHOOK.value
+        ]
         assert len(stored) == 1
-        assert stored[0].dispatch == DISPATCH_LOCAL
+        assert stored[0].dispatch == OutboxDispatch.LOCAL
         assert stored[0].sent is False
 
         publisher = FakeMessagePublisher()
@@ -319,7 +324,7 @@ class TestPaymentServiceProcessing:
         [
             None,
             {
-                "event": WEBHOOK_EVENT,
+                "event": OutboxEventType.PAYMENT_WEBHOOK.value,
                 "event_id": 3,
             },
         ],
@@ -341,7 +346,7 @@ class TestPaymentServiceProcessing:
         records = [
             r
             for r in uow.outbox.all_records()
-            if r.payload.get("event") == WEBHOOK_EVENT
+            if r.payload.get("event") == OutboxEventType.PAYMENT_WEBHOOK.value
         ]
         if persisted_event is None:
             uow.outbox._records.remove(records[0])

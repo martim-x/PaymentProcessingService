@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 from payment.adapters.persistence.repositories.webhook import (
     SqlAlchemyWebhookDeliveryRepository,
 )
+from payment.application.ports.repositories import WebhookDeliveryStatus
 
 pytestmark = [
     pytest.mark.unit,
@@ -105,6 +106,24 @@ class TestMarkDeliveredSql:
 
 
 class TestMarkFailedSql:
+    async def test_read_mapper_constructs_status_enum(self) -> None:
+        session = CapturingSession(
+            row=Row(
+                event_id=EVENT_ID,
+                payment_id=uuid.uuid4(),
+                status="pending",
+                attempts=0,
+                last_error=None,
+                locked_until=None,
+            )
+        )
+        repo = SqlAlchemyWebhookDeliveryRepository(session=session)  # type: ignore[arg-type]
+
+        record = await repo.get(event_id=EVENT_ID)
+
+        assert record is not None
+        assert record.status is WebhookDeliveryStatus.PENDING
+
     async def test_update_is_fenced_by_claim_token(self) -> None:
         session = CapturingSession(
             row=Row(

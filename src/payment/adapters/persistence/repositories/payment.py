@@ -19,44 +19,41 @@ from payment.domain.model.value_objects import (
 )
 
 
-def _to_domain(row: Row[Any]) -> Payment:
-    return Payment(
-        id=PaymentId(value=row.id),
-        amount=Money(
-            amount=row.amount,
-            currency=Currency(row.currency),
-        ),
-        description=row.description,
-        metadata=dict(row.metadata),
-        idempotency_key=IdempotencyKey(value=row.idempotency_key),
-        webhook_url=WebhookUrl(value=row.webhook_url),
-        status=PaymentStatus(row.status),
-        fingerprint=row.fingerprint,
-        failure_reason=row.failure_reason,
-        created_at=row.created_at,
-        processed_at=row.processed_at,
-    )
-
-
-def _to_row_values(payment: Payment) -> dict[str, Any]:
-    return {
-        "id": payment.id.value,
-        "amount": payment.amount.amount,
-        "currency": payment.amount.currency.value,
-        "description": payment.description,
-        "metadata": dict(payment.metadata),
-        "status": payment.status.value,
-        "fingerprint": payment.fingerprint,
-        "idempotency_key": payment.idempotency_key.value,
-        "webhook_url": payment.webhook_url.value,
-        "failure_reason": payment.failure_reason,
-        "created_at": payment.created_at,
-        "processed_at": payment.processed_at,
-    }
-
-
 class SqlAlchemyPaymentRepository:
     """Хранит платежи в SQLAlchemy, преобразуя строки в доменные объекты."""
+
+    @staticmethod
+    def _to_domain(row: Row[Any]) -> Payment:
+        return Payment(
+            id=PaymentId(value=row.id),
+            amount=Money(amount=row.amount, currency=Currency(row.currency)),
+            description=row.description,
+            metadata=dict(row.metadata),
+            idempotency_key=IdempotencyKey(value=row.idempotency_key),
+            webhook_url=WebhookUrl(value=row.webhook_url),
+            status=PaymentStatus(row.status),
+            fingerprint=row.fingerprint,
+            failure_reason=row.failure_reason,
+            created_at=row.created_at,
+            processed_at=row.processed_at,
+        )
+
+    @staticmethod
+    def _to_row_values(payment: Payment) -> dict[str, Any]:
+        return {
+            "id": payment.id.value,
+            "amount": payment.amount.amount,
+            "currency": payment.amount.currency.value,
+            "description": payment.description,
+            "metadata": dict(payment.metadata),
+            "status": payment.status.value,
+            "fingerprint": payment.fingerprint,
+            "idempotency_key": payment.idempotency_key.value,
+            "webhook_url": payment.webhook_url.value,
+            "failure_reason": payment.failure_reason,
+            "created_at": payment.created_at,
+            "processed_at": payment.processed_at,
+        }
 
     def __init__(
         self,
@@ -72,7 +69,7 @@ class SqlAlchemyPaymentRepository:
     ) -> None:
         try:
             await self._session.execute(
-                insert(payments_table).values(**_to_row_values(payment))
+                insert(payments_table).values(**self._to_row_values(payment))
             )
         except IntegrityError as exc:
             # уникальность idempotency_key: наружу — не SQLAlchemy, а application-исключение
@@ -151,7 +148,7 @@ class SqlAlchemyPaymentRepository:
             select(payments_table).where(payments_table.c.id == payment_id.value)
         )
         row = result.first()
-        return _to_domain(row) if row is not None else None
+        return self._to_domain(row) if row is not None else None
 
     async def get_by_idempotency_key(
         self,
@@ -162,4 +159,4 @@ class SqlAlchemyPaymentRepository:
             select(payments_table).where(payments_table.c.idempotency_key == key)
         )
         row = result.first()
-        return _to_domain(row) if row is not None else None
+        return self._to_domain(row) if row is not None else None

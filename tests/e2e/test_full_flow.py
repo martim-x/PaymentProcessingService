@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 import pytest
 
-from payment.adapters.webhook.signer import verify_body
+from payment.adapters.webhook.signer import WebhookSigner
 
 API_URL = os.environ.get(
     "PAYMENT_API_URL",
@@ -228,7 +228,7 @@ class TestFullFlow:
                     timeout=15.0,
                 )
                 assert signature is not None
-                verified = verify_body(
+                verified = WebhookSigner.verify_body(
                     WEBHOOK_SECRET,
                     raw_body,
                     signature,
@@ -288,7 +288,7 @@ class TestFullFlow:
 
                 assert delivered["id"] == payment_id != foreign_id
                 assert signature is not None
-                verified = verify_body(
+                verified = WebhookSigner.verify_body(
                     WEBHOOK_SECRET,
                     raw_body,
                     signature,

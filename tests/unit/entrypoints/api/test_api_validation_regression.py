@@ -11,12 +11,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from payment.adapters.webhook.guard import UnsafeWebhookUrl, validate_public_http_url
+from payment.adapters.webhook.guard import UnsafeWebhookUrl, WebhookUrlGuard
 from payment.application.services.payment_service import PaymentService
 from payment.domain.exceptions import InvalidWebhookUrl
 from payment.domain.model.value_objects import WebhookUrl
-from payment.entrypoints.api.error_handlers import register_error_handlers
-from payment.entrypoints.api.routers.payments import router
+from payment.entrypoints.api.error_handlers import ApiErrorHandlers
+from payment.entrypoints.api.routers.payments import PaymentRoutes
 from tests.fakes import FakeGateway, FakeUnitOfWork
 
 pytestmark = [
@@ -78,8 +78,8 @@ def client(container: _FakeContainer) -> TestClient:
     app = FastAPI()
     app.state.settings = container.settings
     app.state.container = container
-    app.include_router(router)
-    register_error_handlers(app)
+    app.include_router(PaymentRoutes.build_router())
+    ApiErrorHandlers.register(app)
     return TestClient(
         app,
         raise_server_exceptions=False,
@@ -414,7 +414,7 @@ class TestNonGlobalAddresses:
         url: str,
     ) -> None:
         with pytest.raises(UnsafeWebhookUrl):
-            validate_public_http_url(url)
+            WebhookUrlGuard.validate(url)
         with pytest.raises(InvalidWebhookUrl):
             WebhookUrl(value=url)
 
@@ -430,10 +430,10 @@ class TestNonGlobalAddresses:
         url: str,
     ) -> None:
         with pytest.raises(UnsafeWebhookUrl):
-            validate_public_http_url(url)
+            WebhookUrlGuard.validate(url)
 
     def test_guard_still_allows_global_literal_ip(self) -> None:
-        validate_public_http_url("https://93.184.216.34/hook")
+        WebhookUrlGuard.validate("https://93.184.216.34/hook")
 
     @pytest.mark.parametrize(
         "url",

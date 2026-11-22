@@ -7,7 +7,7 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID
 
 from sqlalchemy import Row, case, or_, select, update
@@ -16,33 +16,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment.adapters.persistence.orm import webhook_deliveries_table
 from payment.application.ports.repositories import (
-    DELIVERY_DELIVERED,
-    DELIVERY_DELIVERING,
-    DELIVERY_FAILED,
-    DELIVERY_PENDING,
     WebhookDelivery,
+    WebhookDeliveryStatus,
 )
-
-_MAX_ERROR_LENGTH = 2000
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _delivery_from_row(row: Row[Any]) -> WebhookDelivery:
-    return WebhookDelivery(
-        event_id=row.event_id,
-        payment_id=row.payment_id,
-        status=row.status,
-        attempts=row.attempts,
-        last_error=row.last_error,
-        locked_until=row.locked_until,
-    )
 
 
 class SqlAlchemyWebhookDeliveryRepository:
     """Хранит состояние webhook-доставки и fencing-клеймы в PostgreSQL."""
+
+    _MAX_ERROR_LENGTH: ClassVar[int] = 2000
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _delivery_from_row(row: Row[Any]) -> WebhookDelivery:
+        return WebhookDelivery(
+            event_id=row.event_id,
+            payment_id=row.payment_id,
+            status=WebhookDeliveryStatus(row.status),
+            attempts=row.attempts,
+            last_error=row.last_error,
+            locked_until=row.locked_until,
+        )
 
     def __init__(
         self,
@@ -57,13 +54,13 @@ class SqlAlchemyWebhookDeliveryRepository:
         event_id: str,
         payment_id: UUID,
     ) -> WebhookDelivery:
-        now = _now()
+        now = self._now()
         await self._session.execute(
             insert(webhook_deliveries_table)
             .values(
                 event_id=event_id,
                 payment_id=payment_id,
-                status=DELIVERY_PENDING,
+                status=WebhookDeliveryStatus.PENDING.value,
                 attempts=0,
                 created_at=now,
                 updated_at=now,
@@ -81,7 +78,7 @@ class SqlAlchemyWebhookDeliveryRepository:
         event_id: str,
         ttl_seconds: float,
     ) -> datetime | None:
-        now = _now()
+        now = self._now()
         until = now + timedelta(seconds=ttl_seconds)
         result = await self._session.execute(
             update(webhook_deliveries_table)
@@ -89,8 +86,8 @@ class SqlAlchemyWebhookDeliveryRepository:
                 webhook_deliveries_table.c.event_id == event_id,
                 webhook_deliveries_table.c.status.in_(
                     [
-                        DELIVERY_PENDING,
-                        DELIVERY_DELIVERING,
+                        WebhookDeliveryStatus.PENDING.value,
+                        WebhookDeliveryStatus.DELIVERING.value,
                     ]
                 ),
                 or_(
@@ -99,7 +96,7 @@ class SqlAlchemyWebhookDeliveryRepository:
                 ),
             )
             .values(
-                status=DELIVERY_DELIVERING,
+                status=WebhookDeliveryStatus.DELIVERING.value,
                 locked_until=until,
                 updated_at=now,
             )
@@ -119,13 +116,14 @@ class SqlAlchemyWebhookDeliveryRepository:
             update(webhook_deliveries_table)
             .where(
                 webhook_deliveries_table.c.event_id == event_id,
-                webhook_deliveries_table.c.status == DELIVERY_DELIVERING,
+                webhook_deliveries_table.c.status
+                == WebhookDeliveryStatus.DELIVERING.value,
                 webhook_deliveries_table.c.locked_until == claim_token,
             )
             .values(
-                status=DELIVERY_PENDING,
+                status=WebhookDeliveryStatus.PENDING.value,
                 locked_until=None,
-                updated_at=_now(),
+                updated_at=self._now(),
             )
         )
 
@@ -135,16 +133,17 @@ class SqlAlchemyWebhookDeliveryRepository:
         event_id: str,
         claim_token: datetime,
     ) -> bool:
-        now = _now()
+        now = self._now()
         result = await self._session.execute(
             update(webhook_deliveries_table)
             .where(
                 webhook_deliveries_table.c.event_id == event_id,
-                webhook_deliveries_table.c.status == DELIVERY_DELIVERING,
+                webhook_deliveries_table.c.status
+                == WebhookDeliveryStatus.DELIVERING.value,
                 webhook_deliveries_table.c.locked_until == claim_token,
             )
             .values(
-                status=DELIVERY_DELIVERED,
+                status=WebhookDeliveryStatus.DELIVERED.value,
                 locked_until=None,
                 last_error=None,
                 delivered_at=now,
@@ -162,14 +161,15 @@ class SqlAlchemyWebhookDeliveryRepository:
         max_attempts: int,
         error: str,
     ) -> tuple[int, bool] | None:
-        now = _now()
+        now = self._now()
         attempts = webhook_deliveries_table.c.attempts + 1
         exhausted = attempts >= max_attempts
         result = await self._session.execute(
             update(webhook_deliveries_table)
             .where(
                 webhook_deliveries_table.c.event_id == event_id,
-                webhook_deliveries_table.c.status == DELIVERY_DELIVERING,
+                webhook_deliveries_table.c.status
+                == WebhookDeliveryStatus.DELIVERING.value,
                 webhook_deliveries_table.c.locked_until == claim_token,
             )
             .values(
@@ -177,12 +177,12 @@ class SqlAlchemyWebhookDeliveryRepository:
                 status=case(
                     (
                         exhausted,
-                        DELIVERY_FAILED,
+                        WebhookDeliveryStatus.FAILED.value,
                     ),
-                    else_=DELIVERY_PENDING,
+                    else_=WebhookDeliveryStatus.PENDING.value,
                 ),
                 locked_until=None,
-                last_error=error[:_MAX_ERROR_LENGTH],
+                last_error=error[: self._MAX_ERROR_LENGTH],
                 updated_at=now,
             )
             .returning(
@@ -194,7 +194,7 @@ class SqlAlchemyWebhookDeliveryRepository:
         if row is None:
             # клейм устарел: попытку засчитает и состояние запишет новый владелец
             return None
-        return int(row.attempts), row.status == DELIVERY_FAILED
+        return int(row.attempts), row.status == WebhookDeliveryStatus.FAILED.value
 
     async def get(
         self,
@@ -207,4 +207,4 @@ class SqlAlchemyWebhookDeliveryRepository:
             )
         )
         row = result.first()
-        return _delivery_from_row(row) if row is not None else None
+        return self._delivery_from_row(row) if row is not None else None

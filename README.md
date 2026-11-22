@@ -155,12 +155,12 @@ JSON: `sort_keys`, без пробелов).
 Проверка на стороне получателя:
 
 ```python
-from payment.adapters.webhook.signer import verify_body
+from payment.adapters.webhook.signer import WebhookSigner
 
-ok = verify_body(secret, raw_request_body, request.headers["X-Signature"])
+ok = WebhookSigner.verify_body(secret, raw_request_body, request.headers["X-Signature"])
 ```
 
-`verify_body` дополнительно проверяет окно по времени (по умолчанию 300 секунд).
+`WebhookSigner.verify_body` дополнительно проверяет окно по времени (по умолчанию 300 секунд).
 
 ### Локальный приём webhook
 
@@ -281,7 +281,7 @@ curl -fsS -H "X-API-Key: $PAYMENT_API_KEY" \
   на reverse-proxy/доверенную сеть; в Compose порты опубликованы на хост.
 - **Один общий webhook-секрет** для всех получателей; нет per-endpoint секретов и
   ротации. Получатель обязан сам проверять окно timestamp (библиотечный
-  `verify_body` это делает, но только если его вызвать).
+  `WebhookSigner.verify_body` это делает, но только если его вызвать).
 - **SSRF-защита не абсолютна**: проверка идёт отдельным DNS-запросом, поэтому
   теоретически возможен DNS-rebinding между проверкой и коннектом `httpx`. Для локального
   E2E private targets разрешайте явно через `PAYMENT_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`.

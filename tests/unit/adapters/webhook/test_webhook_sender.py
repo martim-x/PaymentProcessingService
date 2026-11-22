@@ -5,7 +5,7 @@ import pytest
 
 from payment.adapters.webhook import signer
 from payment.adapters.webhook.http_sender import HttpxWebhookSender
-from payment.adapters.webhook.signer import serialize, verify_body
+from payment.adapters.webhook.signer import WebhookSigner
 
 pytestmark = [
     pytest.mark.unit,
@@ -63,7 +63,7 @@ class TestHttpxWebhookSender:
             transport,
         )
 
-        body = serialize(PAYLOAD)
+        body = WebhookSigner.serialize(PAYLOAD)
         timestamp = 1_800_000_000
         monkeypatch.setattr(
             signer.time,
@@ -82,7 +82,7 @@ class TestHttpxWebhookSender:
         )
 
         assert captured["body"] == body
-        assert verify_body(
+        assert WebhookSigner.verify_body(
             SECRET,
             captured["body"],
             captured["headers"]["x-signature"],

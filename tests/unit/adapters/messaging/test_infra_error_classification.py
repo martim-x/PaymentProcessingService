@@ -16,7 +16,9 @@ from sqlalchemy.exc import (
     OperationalError,
 )
 
-from payment.adapters.messaging.error_classification import is_transient_infra_error
+from payment.adapters.messaging.error_classification import (
+    InfrastructureErrorClassifier,
+)
 from payment.application.exceptions import (
     PaymentBusy,
     PaymentNotFound,
@@ -41,11 +43,14 @@ def operational_error() -> OperationalError:
 
 class TestTransientInfrastructureFailures:
     def test_sqlalchemy_operational_error_is_transient(self) -> None:
-        assert is_transient_infra_error(operational_error()) is True
+        assert (
+            InfrastructureErrorClassifier.is_transient_infra_error(operational_error())
+            is True
+        )
 
     def test_sqlalchemy_interface_error_is_transient(self) -> None:
         assert (
-            is_transient_infra_error(
+            InfrastructureErrorClassifier.is_transient_infra_error(
                 InterfaceError(
                     "SELECT 1",
                     {},
@@ -57,7 +62,9 @@ class TestTransientInfrastructureFailures:
 
     def test_sqlalchemy_disconnection_error_is_transient(self) -> None:
         assert (
-            is_transient_infra_error(DisconnectionError("connection invalidated"))
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                DisconnectionError("connection invalidated")
+            )
             is True
         )
 
@@ -65,7 +72,9 @@ class TestTransientInfrastructureFailures:
         psycopg = pytest.importorskip("psycopg")
 
         assert (
-            is_transient_infra_error(psycopg.OperationalError("consuming input failed"))
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                psycopg.OperationalError("consuming input failed")
+            )
             is True
         )
 
@@ -73,22 +82,41 @@ class TestTransientInfrastructureFailures:
         aio_pika = pytest.importorskip("aio_pika.exceptions")
 
         assert (
-            is_transient_infra_error(aio_pika.AMQPConnectionError("connection lost"))
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                aio_pika.AMQPConnectionError("connection lost")
+            )
             is True
         )
 
     def test_publisher_unavailable_is_transient(self) -> None:
         assert (
-            is_transient_infra_error(PublisherUnavailable(message="broker is down"))
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                PublisherUnavailable(message="broker is down")
+            )
             is True
         )
 
     def test_connection_error_is_transient(self) -> None:
-        assert is_transient_infra_error(ConnectionResetError("reset by peer")) is True
+        assert (
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                ConnectionResetError("reset by peer")
+            )
+            is True
+        )
 
     def test_timeout_is_transient(self) -> None:
-        assert is_transient_infra_error(TimeoutError("pool checkout timeout")) is True
-        assert is_transient_infra_error(asyncio.TimeoutError("query timeout")) is True
+        assert (
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                TimeoutError("pool checkout timeout")
+            )
+            is True
+        )
+        assert (
+            InfrastructureErrorClassifier.is_transient_infra_error(
+                asyncio.TimeoutError("query timeout")
+            )
+            is True
+        )
 
     def test_wrapped_transient_error_is_detected_through_the_cause(self) -> None:
         def boom() -> None:
@@ -100,7 +128,9 @@ class TestTransientInfrastructureFailures:
         with pytest.raises(RuntimeError) as caught:
             boom()
 
-        assert is_transient_infra_error(caught.value) is True
+        assert (
+            InfrastructureErrorClassifier.is_transient_infra_error(caught.value) is True
+        )
 
 
 class TestBusinessFailuresAreNotTransient:
@@ -125,7 +155,7 @@ class TestBusinessFailuresAreNotTransient:
         self,
         exc: BaseException,
     ) -> None:
-        assert is_transient_infra_error(exc) is False
+        assert InfrastructureErrorClassifier.is_transient_infra_error(exc) is False
 
     def test_integrity_error_is_a_conflict_not_a_transient_failure(self) -> None:
         conflict = IntegrityError(
@@ -134,7 +164,7 @@ class TestBusinessFailuresAreNotTransient:
             Exception("duplicate key"),
         )
 
-        assert is_transient_infra_error(conflict) is False
+        assert InfrastructureErrorClassifier.is_transient_infra_error(conflict) is False
 
     def test_business_error_wrapping_another_business_error_is_not_transient(
         self,
@@ -147,4 +177,4 @@ class TestBusinessFailuresAreNotTransient:
         except RuntimeError as caught:
             wrapped = caught
 
-        assert is_transient_infra_error(wrapped) is False
+        assert InfrastructureErrorClassifier.is_transient_infra_error(wrapped) is False

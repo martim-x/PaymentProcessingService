@@ -10,13 +10,10 @@ from typing import Any
 
 from payment.application.ports.payment_gateway import GatewayResult
 from payment.application.ports.repositories import (
-    DELIVERY_DELIVERED,
-    DELIVERY_DELIVERING,
-    DELIVERY_FAILED,
-    DELIVERY_PENDING,
-    DISPATCH_RELAY,
+    OutboxDispatch,
     OutboxRecord,
     WebhookDelivery,
+    WebhookDeliveryStatus,
 )
 from payment.domain.model.enums import PaymentStatus
 from payment.domain.model.payment import Payment
@@ -149,7 +146,7 @@ class FakeOutboxRepository:
         *,
         payload: dict[str, object],
         aggregate_id: str,
-        dispatch: str = DISPATCH_RELAY,
+        dispatch: OutboxDispatch = OutboxDispatch.RELAY,
     ) -> OutboxRecord:
         if self.fail_next_add:
             self.fail_next_add = False
@@ -178,7 +175,7 @@ class FakeOutboxRepository:
         return [
             r
             for r in self._records
-            if not r.sent and not r.failed and r.dispatch == DISPATCH_RELAY
+            if not r.sent and not r.failed and r.dispatch == OutboxDispatch.RELAY
         ][:batch]
 
     async def mark_attempt_failed(
@@ -237,8 +234,8 @@ class FakeWebhookDeliveryRepository:
     ) -> datetime | None:
         record = self._records.get(event_id)
         if record is None or record.status in (
-            DELIVERY_DELIVERED,
-            DELIVERY_FAILED,
+            WebhookDeliveryStatus.DELIVERED,
+            WebhookDeliveryStatus.FAILED,
         ):
             return None
         now = datetime.now(timezone.utc)
@@ -248,7 +245,7 @@ class FakeWebhookDeliveryRepository:
         token = now + timedelta(seconds=ttl_seconds)
         self._locked_until[event_id] = token
         self.tokens.append(token)
-        record.status = DELIVERY_DELIVERING
+        record.status = WebhookDeliveryStatus.DELIVERING
         record.locked_until = token
         return token
 
@@ -267,7 +264,7 @@ class FakeWebhookDeliveryRepository:
         record = self._records.get(event_id)
         if record is not None:
             record.locked_until = None
-            record.status = DELIVERY_PENDING
+            record.status = WebhookDeliveryStatus.PENDING
 
     async def mark_delivered(
         self,
@@ -276,13 +273,13 @@ class FakeWebhookDeliveryRepository:
         claim_token: datetime,
     ) -> bool:
         record = self._records.get(event_id)
-        if record is None or record.status != DELIVERY_DELIVERING:
+        if record is None or record.status != WebhookDeliveryStatus.DELIVERING:
             return False
         if self._locked_until.get(event_id) != claim_token:
             return (
                 False  # fencing: клейм устарел, состояние принадлежит новому владельцу
             )
-        record.status = DELIVERY_DELIVERED
+        record.status = WebhookDeliveryStatus.DELIVERED
         record.locked_until = None
         self._locked_until.pop(
             event_id,
@@ -300,21 +297,23 @@ class FakeWebhookDeliveryRepository:
         error: str,
     ) -> tuple[int, bool] | None:
         record = self._records.get(event_id)
-        if record is None or record.status != DELIVERY_DELIVERING:
+        if record is None or record.status != WebhookDeliveryStatus.DELIVERING:
             return None
         if self._locked_until.get(event_id) != claim_token:
             return None  # fencing: попытку засчитает новый владелец
         record.attempts += 1
         record.last_error = error
         record.status = (
-            DELIVERY_FAILED if record.attempts >= max_attempts else DELIVERY_PENDING
+            WebhookDeliveryStatus.FAILED
+            if record.attempts >= max_attempts
+            else WebhookDeliveryStatus.PENDING
         )
         record.locked_until = None
         self._locked_until.pop(
             event_id,
             None,
         )
-        return record.attempts, record.status == DELIVERY_FAILED
+        return record.attempts, record.status == WebhookDeliveryStatus.FAILED
 
     async def get(
         self,

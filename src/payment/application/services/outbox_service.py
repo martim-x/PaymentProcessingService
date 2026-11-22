@@ -12,9 +12,6 @@ from payment.application.ports.unit_of_work import AbstractUnitOfWork
 
 logger = logging.getLogger(__name__)
 
-PAYMENT_CREATED_EVENT = "payment.created"
-DEFAULT_ROUTES: Mapping[str, str] = {}
-
 
 class OutboxService:
     """Публикует сохранённые события и помечает результат в outbox."""
@@ -30,7 +27,7 @@ class OutboxService:
     ) -> None:
         self._uow = uow
         self._publisher = publisher
-        self._routes = dict(routes or DEFAULT_ROUTES)
+        self._routes = dict(routes) if routes is not None else {}
         self._subject = subject
         self._max_attempts = max_attempts
 

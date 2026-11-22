@@ -4,8 +4,8 @@ from typing import Any
 
 import httpx
 
-from payment.adapters.webhook.guard import validate_public_http_url_async
-from payment.adapters.webhook.signer import serialize, sign_body
+from payment.adapters.webhook.guard import WebhookUrlGuard
+from payment.adapters.webhook.signer import WebhookSigner
 from payment.application.ports.webhook_sender import WebhookSender
 
 
@@ -34,10 +34,10 @@ class HttpxWebhookSender(WebhookSender):
         payload: dict[str, Any],
     ) -> None:
         if not self._allow_private_hosts:
-            await validate_public_http_url_async(url)
+            await WebhookUrlGuard.validate_async(url)
 
-        body = serialize(payload)
-        signature, timestamp = sign_body(
+        body = WebhookSigner.serialize(payload)
+        signature, timestamp = WebhookSigner.sign_body(
             self._secret,
             body,
         )

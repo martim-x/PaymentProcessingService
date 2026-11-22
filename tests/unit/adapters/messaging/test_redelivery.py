@@ -3,9 +3,9 @@
 import pytest
 from pamqp.commands import Basic
 
-from payment.adapters.messaging.publisher import _is_unavailable, ensure_confirmed
-from payment.adapters.messaging.redelivery import publish_failure, publish_or_requeue
-from payment.adapters.messaging.routing import ATTEMPT_HEADER, FailureRoute
+from payment.adapters.messaging.publisher import FastStreamPublisher
+from payment.adapters.messaging.redelivery import MessageRedeliverer
+from payment.adapters.messaging.routing import BrokerRetryHeader, FailureRoute
 from payment.application.ports.message_publisher import (
     PublisherUnavailable,
     PublishRejected,
@@ -15,6 +15,24 @@ pytestmark = [
     pytest.mark.unit,
     pytest.mark.adapters,
 ]
+
+
+def _is_unavailable(exc: BaseException) -> bool:
+    return FastStreamPublisher._is_unavailable(exc)
+
+
+def ensure_confirmed(confirmation: object, subject: str) -> None:
+    FastStreamPublisher.ensure_confirmed(confirmation=confirmation, subject=subject)
+
+
+async def publish_failure(broker, message, payload, decision):
+    return await MessageRedeliverer.publish_failure(
+        broker=broker, message=message, payload=payload, decision=decision
+    )
+
+
+async def publish_or_requeue(**kwargs):
+    return await MessageRedeliverer.publish_or_requeue(**kwargs)
 
 
 class FakeMessage:
@@ -191,7 +209,10 @@ class TestPublishOrRequeue:
             decision,
         )
 
-        assert broker.published[0]["headers"] == {ATTEMPT_HEADER: 2}
+        headers = broker.published[0]["headers"]
+
+        assert headers == {BrokerRetryHeader.ATTEMPT.value: 2}
+        assert all(type(key) is str for key in headers)
 
     async def test_dlq_decision_has_no_attempt_header(self) -> None:
         message = FakeMessage()

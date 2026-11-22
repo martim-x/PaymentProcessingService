@@ -14,16 +14,19 @@ from aiormq.abc import DeliveredMessage
 from faststream.exceptions import IncorrectState
 from pamqp.base import Frame
 
-from payment.adapters.messaging.publisher import (
-    _UNAVAILABLE_TYPES as _UNAVAILABLE_TYPES_FOR_TEST,
-)
-from payment.adapters.messaging.publisher import _is_unavailable
+from payment.adapters.messaging.publisher import FastStreamPublisher
 from payment.application.ports.message_publisher import PublisherUnavailable
+
+_UNAVAILABLE_TYPES_FOR_TEST = FastStreamPublisher._UNAVAILABLE_TYPES
 
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.adapters,
 ]
+
+
+def _is_unavailable(exc: BaseException) -> bool:
+    return FastStreamPublisher._is_unavailable(exc)
 
 
 class _Frame:

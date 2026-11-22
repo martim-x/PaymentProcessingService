@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from payment.domain.exceptions import InvalidMoney, InvalidWebhookUrl
-from payment.entrypoints.api.error_handlers import register_error_handlers
+from payment.entrypoints.api.error_handlers import ApiErrorHandlers
 
 pytestmark = [
     pytest.mark.unit,
@@ -15,7 +15,7 @@ pytestmark = [
 
 def build_app() -> FastAPI:
     app = FastAPI()
-    register_error_handlers(app)
+    ApiErrorHandlers.register(app)
 
     @app.get("/bad-money")
     async def bad_money() -> dict:

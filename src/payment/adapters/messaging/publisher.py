@@ -30,38 +30,42 @@ from faststream.exceptions import IncorrectState
 from faststream.rabbit import RabbitBroker
 from pamqp.commands import Basic
 
-from payment.adapters.messaging.topology import MAIN_QUEUE
+from payment.adapters.messaging.topology import RabbitTopology
 from payment.application.ports.message_publisher import (
     MessagePublisher,
     PublisherUnavailable,
     PublishRejected,
 )
 
-# только транспортные ошибки: брокер/канал недоступны, ожидание лечит
-_UNAVAILABLE_TYPES: tuple[type[BaseException], ...] = (
-    AMQPConnectionError,
-    ConnectionClosed,
-    ChannelClosed,
-    ChannelInvalidStateError,
-    IncorrectState,  # FastStream: публикация в неподключённый брокер
-    OSError,  # ConnectionError и TimeoutError — его подклассы, отдельно не нужны
-)
-
-
-def _is_unavailable(exc: BaseException) -> bool:
-    if isinstance(
-        exc,
-        PublisherUnavailable,
-    ):
-        return True
-    return isinstance(
-        exc,
-        _UNAVAILABLE_TYPES,
-    )
-
 
 class FastStreamPublisher(MessagePublisher):
     """Публикует сообщения в RabbitMQ и проверяет подтверждение брокера."""
+
+    # только транспортные ошибки: брокер/канал недоступны, ожидание лечит
+    _UNAVAILABLE_TYPES: tuple[type[BaseException], ...] = (
+        AMQPConnectionError,
+        ConnectionClosed,
+        ChannelClosed,
+        ChannelInvalidStateError,
+        IncorrectState,
+        OSError,
+    )
+
+    @staticmethod
+    def _is_unavailable(exc: BaseException) -> bool:
+        if isinstance(exc, PublisherUnavailable):
+            return True
+        return isinstance(exc, FastStreamPublisher._UNAVAILABLE_TYPES)
+
+    @staticmethod
+    def ensure_confirmed(*, confirmation: object, subject: str) -> None:
+        """Reject missing and negative broker publisher confirms."""
+        if confirmation is None:
+            raise PublisherUnavailable(message="broker did not confirm the publish")
+        if isinstance(confirmation, Basic.Nack) or confirmation is False:
+            raise PublishRejected(
+                message=f"broker rejected the publish with basic.nack (queue={subject})"
+            )
 
     def __init__(
         self,
@@ -81,45 +85,18 @@ class FastStreamPublisher(MessagePublisher):
             # subject — имя очереди (маршрутизация через default exchange)
             confirmation = await self._broker.publish(
                 payload,
-                queue=subject or MAIN_QUEUE,
+                queue=subject or RabbitTopology.MAIN_QUEUE,
                 persist=True,
                 mandatory=True,
                 message_id=message_id,
             )
         except Exception as exc:
-            if _is_unavailable(exc):
+            if self._is_unavailable(exc):
                 raise PublisherUnavailable(
                     message=f"{type(exc).__name__}: {exc}"
                 ) from exc
             raise
-        ensure_confirmed(
-            confirmation,
-            subject,
-        )
-
-
-def ensure_confirmed(
-    confirmation: object,
-    subject: str,
-) -> None:
-    """Publisher confirms: None и basic.nack — НЕ успешная публикация.
-
-    - None: подтверждения выключены / соединение закрылось до ответа — это
-      недоступность транспорта, запись outbox повторяется без штрафа;
-    - `basic.nack` (или False в старых клиентах): брокер отказал в приёме —
-      ошибка конкретной записи, outbox считает попытку;
-    - `basic.return` при `on_return_raises=True` превращается в DeliveryError
-      ещё внутри publish, сюда не доходит.
-    """
-    if confirmation is None:
-        raise PublisherUnavailable(message="broker did not confirm the publish")
-    if (
-        isinstance(
-            confirmation,
-            Basic.Nack,
-        )
-        or confirmation is False
-    ):
-        raise PublishRejected(
-            message=f"broker rejected the publish with basic.nack (queue={subject})"
+        self.ensure_confirmed(
+            confirmation=confirmation,
+            subject=subject,
         )

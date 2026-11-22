@@ -8,17 +8,21 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
-def make_engine(database_url: str) -> AsyncEngine:
-    return create_async_engine(
-        database_url,
-        pool_pre_ping=True,
-        future=True,
-    )
+class SqlAlchemyDatabase:
+    """Factories for SQLAlchemy persistence resources."""
 
+    @staticmethod
+    def make_engine(database_url: str) -> AsyncEngine:
+        return create_async_engine(
+            database_url,
+            pool_pre_ping=True,
+            future=True,
+        )
 
-def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(
-        bind=engine,
-        expire_on_commit=False,
-        autoflush=False,
-    )
+    @staticmethod
+    def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+        return async_sessionmaker(
+            bind=engine,
+            expire_on_commit=False,
+            autoflush=False,
+        )

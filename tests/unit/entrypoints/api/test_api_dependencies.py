@@ -22,8 +22,8 @@ os.environ.setdefault(
 from fastapi.testclient import TestClient
 
 from payment.adapters.persistence.unit_of_work import SqlAlchemyUnitOfWork
-from payment.entrypoints.api.dependencies import build_payment_service
-from payment.entrypoints.api.routers.payments import _command
+from payment.entrypoints.api.dependencies import RequestDependencies
+from payment.entrypoints.api.routers.payments import PaymentRoutes
 from payment.entrypoints.api.schemas import CreatePaymentRequest
 
 pytestmark = [
@@ -58,9 +58,9 @@ class TestPerRequestService:
         container = CountingContainer()
         request = fake_request(container)
 
-        first = build_payment_service(request)
-        second = build_payment_service(request)
-        third = build_payment_service(request)
+        first = RequestDependencies.build_payment_service(request)
+        second = RequestDependencies.build_payment_service(request)
+        third = RequestDependencies.build_payment_service(request)
 
         assert first is not second
         assert len(container.created) == 3
@@ -75,14 +75,14 @@ class TestApiRoutesAuthentication:
             "payment.entrypoints.api.app",
             None,
         )
-        from payment.entrypoints.api.app import create_app
+        from payment.entrypoints.api.app import PaymentApi
 
         settings = SimpleNamespace(api_key="test-api-key")
         container = SimpleNamespace(
             settings=settings,
             payment_service=lambda: object(),
         )
-        app = create_app(container)  # type: ignore[arg-type]
+        app = PaymentApi.create_app(container)  # type: ignore[arg-type]
         client = TestClient(app)
 
         for path in (
@@ -129,14 +129,14 @@ class TestApiRoutesAuthentication:
             "payment.entrypoints.api.app",
             None,
         )
-        from payment.entrypoints.api.app import create_app
+        from payment.entrypoints.api.app import PaymentApi
 
         settings = SimpleNamespace(api_key="test-api-key")
         container = SimpleNamespace(
             settings=settings,
             payment_service=lambda: object(),
         )
-        client = TestClient(create_app(container))  # type: ignore[arg-type]
+        client = TestClient(PaymentApi.create_app(container))  # type: ignore[arg-type]
 
         assert client.get("/api/v1/openapi.json").status_code == 401
         assert (
@@ -205,7 +205,7 @@ class TestCommandBuilding:
             webhook_url="https://example.com/hook",
         )
 
-        command = _command(
+        command = PaymentRoutes._command(
             body,
             f"key-{uuid.uuid4()}",
         )

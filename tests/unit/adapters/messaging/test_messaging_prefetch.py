@@ -9,7 +9,7 @@ from pamqp.base import Frame
 
 from payment.adapters.messaging.publisher import FastStreamPublisher
 from payment.application.ports.message_publisher import PublisherUnavailable
-from payment.bootstrap import make_broker, make_channel
+from payment.bootstrap import Container
 from payment.config import Settings
 
 pytestmark = [
@@ -32,23 +32,39 @@ def settings(**overrides) -> Settings:
 class TestPrefetch:
     def test_prefetch_is_set_on_the_channel(self) -> None:
         """consume_args подписчика не доходил до QoS: prefetch живёт на канале."""
-        channel = make_channel(settings(consumer_prefetch=7))
-
+        container = Container(settings=settings(consumer_prefetch=7))
+        broker = container.get_broker()
+        channel = (
+            broker.config.channel_manager._ChannelManagerImpl__default_channel
+        )  # noqa: SLF001
         assert channel.prefetch_count == 7
 
     def test_channel_enables_confirms_and_mandatory_returns(self) -> None:
-        channel = make_channel(settings())
+        container = Container(settings=settings())
+        broker = container.get_broker()
+        channel = (
+            broker.config.channel_manager._ChannelManagerImpl__default_channel
+        )  # noqa: SLF001
 
         assert channel.publisher_confirms is True
         assert channel.on_return_raises is True
 
     def test_broker_uses_that_channel(self) -> None:
-        broker = make_broker(settings(consumer_prefetch=3))
+        container = Container(settings=settings(consumer_prefetch=3))
+        broker = container.get_broker()
 
         channel = (
             broker.config.channel_manager._ChannelManagerImpl__default_channel
         )  # noqa: SLF001
         assert channel.prefetch_count == 3
+        assert broker is container.get_broker()
+
+    def test_broker_creation_is_lazy_until_public_getter(self) -> None:
+        container = Container(settings=settings())
+
+        assert container._broker is None  # noqa: SLF001
+        broker = container.get_broker()
+        assert container._broker is broker  # noqa: SLF001
 
 
 class TestQueueConfig:

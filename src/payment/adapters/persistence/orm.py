@@ -18,6 +18,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
+from payment.application.ports.repositories import OutboxDispatch, WebhookDeliveryStatus
+
 metadata = MetaData()
 
 payments_table = Table(
@@ -144,8 +146,8 @@ outbox_table = Table(
         "dispatch",
         String(16),
         nullable=False,
-        default="relay",
-        server_default=text("'relay'"),
+        default=OutboxDispatch.RELAY.value,
+        server_default=text(f"'{OutboxDispatch.RELAY.value}'"),
     ),
     Column(
         "failed",
@@ -182,8 +184,8 @@ webhook_deliveries_table = Table(
         "status",
         String(16),
         nullable=False,
-        default="pending",
-        server_default=text("'pending'"),
+        default=WebhookDeliveryStatus.PENDING.value,
+        server_default=text(f"'{WebhookDeliveryStatus.PENDING.value}'"),
     ),
     Column(
         "attempts",
@@ -231,7 +233,9 @@ Index(
 Index(
     "ix_outbox_relay_pending",
     outbox_table.c.created_at,
-    postgresql_where=text("sent = false AND failed = false AND dispatch = 'relay'"),
+    postgresql_where=text(
+        f"sent = false AND failed = false AND dispatch = '{OutboxDispatch.RELAY.value}'"
+    ),
 )
 Index(
     "ix_outbox_event_type",

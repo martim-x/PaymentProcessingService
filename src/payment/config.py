@@ -4,24 +4,27 @@
 """
 
 from functools import lru_cache
+from typing import ClassVar
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
-
-_INSECURE_DEFAULTS = {
-    "",
-    "change-me",
-    "change-me-secret-api-key",
-    "change-me-webhook-signing-secret",
-    "change-this-api-key",
-    "change-this-webhook-secret",
-}
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 
 
 class Settings(BaseSettings):
     """Настройки сервиса из переменных окружения с префиксом `PAYMENT_`."""
+
+    _INSECURE_DEFAULTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "",
+            "change-me",
+            "change-me-secret-api-key",
+            "change-me-webhook-signing-secret",
+            "change-this-api-key",
+            "change-this-webhook-secret",
+        }
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="PAYMENT_",
@@ -212,19 +215,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_secrets(self) -> "Settings":
-        if self.api_key.strip().lower() in _INSECURE_DEFAULTS:
+        if self.api_key.strip().lower() in self._INSECURE_DEFAULTS:
             raise ValueError(
                 "PAYMENT_API_KEY is not set (or left at the insecure default); "
                 "set a real API key before starting the service"
             )
-        if self.webhook_secret.strip().lower() in _INSECURE_DEFAULTS:
+        if self.webhook_secret.strip().lower() in self._INSECURE_DEFAULTS:
             raise ValueError(
                 "PAYMENT_WEBHOOK_SECRET is not set (or left at the insecure default); "
                 "set a real webhook signing secret"
             )
         return self
 
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
+    @classmethod
+    @lru_cache
+    def from_environment(cls) -> "Settings":
+        """Загружает и кеширует конфигурацию процесса."""
+        return cls()

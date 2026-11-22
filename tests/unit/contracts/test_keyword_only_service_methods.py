@@ -7,7 +7,7 @@ import pytest
 from payment.application.services.outbox_service import OutboxService
 from payment.application.services.payment_service import PaymentService
 from payment.application.services.webhook_service import WebhookService
-from payment.domain.services.retry_policy import ExponentialBackoffRetryPolicy
+from payment.domain.policies.retry_policy import ExponentialBackoffRetryPolicy
 
 pytestmark = [
     pytest.mark.unit,

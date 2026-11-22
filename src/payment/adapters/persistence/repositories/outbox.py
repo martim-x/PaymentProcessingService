@@ -8,24 +8,24 @@ from sqlalchemy import Row, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from payment.adapters.persistence.orm import outbox_table
-from payment.application.ports.repositories import DISPATCH_RELAY, OutboxRecord
-
-
-def _record_from_row(row: Row[Any]) -> OutboxRecord:
-    return OutboxRecord(
-        id=row.id,
-        aggregate_id=row.aggregate_id,
-        payload=dict(row.payload),
-        sent=row.sent,
-        attempts=row.attempts,
-        failed=row.failed,
-        event_type=row.event_type,
-        dispatch=row.dispatch,
-    )
+from payment.application.ports.repositories import OutboxDispatch, OutboxRecord
 
 
 class SqlAlchemyOutboxRepository:
     """Работает с событиями outbox через текущую SQLAlchemy-сессию."""
+
+    @staticmethod
+    def _record_from_row(row: Row[Any]) -> OutboxRecord:
+        return OutboxRecord(
+            id=row.id,
+            aggregate_id=row.aggregate_id,
+            payload=dict(row.payload),
+            sent=row.sent,
+            attempts=row.attempts,
+            failed=row.failed,
+            event_type=row.event_type,
+            dispatch=OutboxDispatch(row.dispatch),
+        )
 
     def __init__(
         self,
@@ -53,14 +53,14 @@ class SqlAlchemyOutboxRepository:
             .limit(1)
         )
         row = result.first()
-        return _record_from_row(row) if row is not None else None
+        return self._record_from_row(row) if row is not None else None
 
     async def add(
         self,
         *,
         payload: dict[str, object],
         aggregate_id: str,
-        dispatch: str = DISPATCH_RELAY,
+        dispatch: OutboxDispatch = OutboxDispatch.RELAY,
     ) -> OutboxRecord:
         record_id = uuid.uuid4()
         event_type = str(
@@ -77,7 +77,7 @@ class SqlAlchemyOutboxRepository:
                 payload=dict(payload),
                 created_at=datetime.now(timezone.utc),
                 sent=False,
-                dispatch=dispatch,
+                dispatch=dispatch.value,
             )
         )
         return OutboxRecord(
@@ -85,7 +85,7 @@ class SqlAlchemyOutboxRepository:
             aggregate_id=aggregate_id,
             payload=dict(payload),
             event_type=event_type,
-            dispatch=dispatch,
+            dispatch=OutboxDispatch(dispatch),
         )
 
     async def fetch_unsent(
@@ -99,13 +99,13 @@ class SqlAlchemyOutboxRepository:
             .where(
                 outbox_table.c.sent.is_(False),
                 outbox_table.c.failed.is_(False),
-                outbox_table.c.dispatch == DISPATCH_RELAY,
+                outbox_table.c.dispatch == OutboxDispatch.RELAY.value,
             )
             .order_by(outbox_table.c.created_at)
             .limit(batch)
             .with_for_update(skip_locked=True)
         )
-        return [_record_from_row(row) for row in result]
+        return [self._record_from_row(row) for row in result]
 
     async def mark_sent(
         self,
