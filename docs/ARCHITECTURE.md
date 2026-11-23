@@ -186,7 +186,7 @@ relay ── SELECT ... WHERE sent=false AND failed=false AND dispatch='relay' F
 | Валидация входа | `api/schemas.py`, `api/dependencies.py` | Нет лимита на тело целиком и rate limiting |
 | Непривилегированный контейнер | `Dockerfile` (uid 10001) | Инфраструктура (RabbitMQ UI, PostgreSQL) опубликована на хост |
 
-Чего в сервисе нет: TLS, ротации ключей, per-endpoint секретов, шифрования at-rest, аудита доступа, антифрода и аутентификации на DLQ/management UI. Это осознанные границы учебного проекта; перечень — в [`README.md`](../README.md#ограничения-безопасности).
+Текущая конфигурация не включает TLS, ротацию ключей, per-endpoint секреты, шифрование at-rest, аудит доступа, антифрод и аутентификацию на DLQ/management UI. Перечень ограничений приведён в [`README.md`](../README.md#ограничения-безопасности).
 
 ## Назначение основных абстракций
 
